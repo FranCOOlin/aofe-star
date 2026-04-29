@@ -295,6 +295,15 @@ class TaskFSMNode:
         self.current_t0 = 0.0
         self.action_start_wall_time = 0.0
 
+        # 已经启动过的同步会话 ID。
+        #
+        # 用途：防止同一个 sync_id 被启动两次。
+        # 原因：TaskFSM 有两条启动路径：
+        #   1. 收到 SCHEDULED 后，主循环在 now >= t0 时主动启动；
+        #   2. 收到 SyncGate 的 START 兜底事件后启动。
+        # 这两条路径可能在 t0 附近几乎同时触发，因此必须按 sync_id 去重。
+        self.started_sync_ids = set()
+
         # SCHEDULED 事件缓存。
         self.scheduled_event: Optional[dict] = None
 
@@ -1019,19 +1028,56 @@ class TaskFSMNode:
     def _start_action_from_event(self, event: dict):
         """
         同步器触发后的 action -> task_state 映射。
+
+        注意：
+            同一个同步会话可能通过两条路径触发：
+                1. SCHEDULED 事件保存 t0 后，FSM 主循环检测 now >= t0；
+                2. SyncGate 到 t0 后发布 START 兜底事件。
+
+            这两条路径在 t0 附近可能几乎同时到达。
+            因此这里必须用 sync_id 做幂等保护，保证同一个同步会话只启动一次。
         """
         action = event.get("action", "")
+        event_sync_id = event.get("sync_id", "")
+
+        if not event_sync_id:
+            rospy.logwarn(
+                "[%s TaskFSM] ignore sync event without sync_id action=%s event=%s",
+                self.self_id,
+                action,
+                event,
+            )
+            return
+
+        # 防重复启动：
+        # 如果 SCHEDULED 到点触发和 START 兜底事件都调用了本函数，
+        # 第二次会被这里挡住，避免重复规划轨迹、重复发送 LAND、重复状态进入动作。
+        if event_sync_id in self.started_sync_ids:
+            rospy.logwarn(
+                "[%s TaskFSM] ignore duplicated sync start action=%s sync_id=%s",
+                self.self_id,
+                action,
+                event_sync_id,
+            )
+            return
+
         expected = self.expected_action()
 
         if action != expected:
             rospy.logwarn(
-                "[%s TaskFSM] ignore sync event action=%s expected=%s state=%s",
+                "[%s TaskFSM] ignore sync event action=%s expected=%s state=%s sync_id=%s",
                 self.self_id,
                 action,
                 expected,
                 self.task_state,
+                event_sync_id,
             )
             return
+
+        # 通过 action/state 检查后，立刻登记为已启动。
+        # 必须在真正执行 _on_synced_xxx_start() 之前登记，
+        # 否则两个回调连续进入时仍可能重复执行一次性动作。
+        self.started_sync_ids.add(event_sync_id)
 
         self.current_action = action
         self.current_payload = event.get("payload", {})
@@ -1172,6 +1218,10 @@ class TaskFSMNode:
         self.cmd_emergency_hold = False
 
         self._finish_action()
+
+        # 一轮任务结束后清空已启动 sync_id 记录。
+        # 新一轮任务会生成新的 sync_id；这里清空可以避免集合无限增长。
+        self.started_sync_ids.clear()
 
         self.hook_sequence_start_time = 0.0
         self.hook_released = False

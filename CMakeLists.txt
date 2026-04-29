@@ -163,6 +163,7 @@ catkin_install_python(PROGRAMS
    scripts/sync_gate_node.py
    scripts/task_fsm_node.py
    scripts/minimal_sync_test_node.py
+   scripts/fsm_auto_test.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )
 
