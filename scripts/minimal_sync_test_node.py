@@ -322,8 +322,30 @@ class MinimalSyncTestNode:
         if self.current_t0 <= 0:
             return
 
-        if now_sec() >= self.current_t0:
-            self._start_running(self.scheduled_event)
+        now = now_sec()
+        remain = self.current_t0 - now
+
+        # 还很早，不启动
+        if remain > 0.02:
+            return
+
+        # 距离 t0 进入 20ms 内，做一次更精细等待
+        # 注意：这里会短暂阻塞当前节点，所以只适合临近触发时使用
+        while not rospy.is_shutdown():
+            now = now_sec()
+            remain = self.current_t0 - now
+
+            if remain <= 0:
+                break
+
+            # 还剩 2ms 以上，用短 sleep，避免 CPU 占用太高
+            if remain > 0.002:
+                rospy.sleep(0.0005)
+            else:
+                # 最后 2ms busy wait，提高触发精度
+                pass
+
+        self._start_running(self.scheduled_event)
 
     def _start_running(self, event: dict):
         if self.state == STATE_RUNNING:

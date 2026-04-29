@@ -11,7 +11,7 @@
     <!-- 本次测试 run_id，所有机器保持一致 -->
     <arg name="run_id" default="sync_test_001"/>
 
-    <arg name="control_rate_hz" default="50.0"/>
+    <arg name="control_rate_hz" default="500.0"/>
 
     <!-- ===================================================== -->
     <!-- 最小测试节点：模拟 task_fsm_node                        -->
