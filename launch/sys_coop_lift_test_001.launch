@@ -1,0 +1,90 @@
+<launch>
+    <!-- 当前节点角色：master 或 slave -->
+    <arg name="role" default="slave"/>
+
+    <!-- 当前机器 ID：master / uav1 / uav2 / ... -->
+    <arg name="self_id" default="uav1"/>
+
+    <!-- master 需要等待的 slave 列表，一般不包含 master -->
+    <arg name="participants" default="uav1,uav2"/>
+
+    <!-- 本次实验流程 ID，建议所有机器保持一致 -->
+    <arg name="run_id" default="coop_lift_test_001"/>
+
+    <!-- 只有 master 的 auto_start 有意义 -->
+    <arg name="auto_start" default="false"/>
+
+    <arg name="control_rate_hz" default="50.0"/>
+
+    <!-- ===================================================== -->
+    <!-- 任务状态机节点                                         -->
+    <!-- ===================================================== -->
+
+    <node pkg="aofe_star"
+          type="task_fsm_node.py"
+          name="$(arg self_id)_task_fsm"
+          output="screen">
+
+        <param name="role" value="$(arg role)"/>
+        <param name="self_id" value="$(arg self_id)"/>
+
+        <param name="control_rate_hz" value="$(arg control_rate_hz)"/>
+        <param name="task_status_rate" value="20.0"/>
+        <param name="task_request_rate" value="1.0"/>
+
+        <param name="auto_start" value="$(arg auto_start)"/>
+
+        <param name="takeoff_height" value="3.0"/>
+        <param name="takeoff_duration" value="6.0"/>
+        <param name="switch_mission_duration" value="2.0"/>
+        <param name="transport_duration" value="8.0"/>
+        <param name="release_duration" value="2.0"/>
+
+        <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
+        <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
+        <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
+        <param name="start_topic" value="/$(arg self_id)/task/start"/>
+    </node>
+
+    <!-- ===================================================== -->
+    <!-- 同步器节点                                             -->
+    <!-- ===================================================== -->
+
+    <node pkg="aofe_star"
+          type="sync_gate_node.py"
+          name="$(arg self_id)_sync_gate"
+          output="screen">
+
+        <param name="role" value="$(arg role)"/>
+        <param name="self_id" value="$(arg self_id)"/>
+        <param name="participants" value="$(arg participants)"/>
+
+        <param name="run_id" value="$(arg run_id)"/>
+        <param name="run_label" value="coop_lift_test"/>
+
+        <param name="control_rate_hz" value="$(arg control_rate_hz)"/>
+
+        <!-- 最终 t0 在收齐 ACK_PREPARE 后生成：t0 = now + start_delay -->
+        <param name="start_delay" value="5.0"/>
+        <param name="min_t0_margin" value="1.0"/>
+
+        <param name="task_status_timeout" value="1.0"/>
+        <param name="global_status_timeout" value="2.0"/>
+        <param name="prepare_timeout" value="3.0"/>
+        <param name="commit_timeout" value="3.0"/>
+        <param name="abort_duration" value="2.0"/>
+
+        <!-- 机间带宽宝贵时，global_status_rate 建议低频 -->
+        <param name="command_rate" value="5.0"/>
+        <param name="ack_rate" value="5.0"/>
+        <param name="global_status_rate" value="1.0"/>
+
+        <param name="command_topic" value="/sync/command"/>
+        <param name="ack_topic" value="/sync/ack"/>
+        <param name="global_status_topic" value="/sync/status"/>
+
+        <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
+        <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
+        <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
+    </node>
+</launch>

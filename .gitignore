@@ -1,0 +1,65 @@
+# =====================
+# OS / Editor
+# =====================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =====================
+# Python
+# =====================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# =====================
+# C/C++ / CMake
+# =====================
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.o
+*.so
+*.a
+*.out
+
+# =====================
+# ROS / catkin
+# =====================
+devel/
+install/
+log/
+.logs/
+.catkin_tools/
+
+# =====================
+# Data / logs / large files
+# =====================
+*.bag
+*.db3
+*.ulg
+*.csv
+*.log
+*.mp4
+*.avi
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# =====================
+# Secrets
+# =====================
+.env
+*.pem
+*.key
+id_rsa
+id_rsa.pub
