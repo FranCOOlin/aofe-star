@@ -1,0 +1,94 @@
+<launch>
+    <!-- 当前节点角色：master 或 slave -->
+    <arg name="role" default="slave"/>
+
+    <!-- 当前机器 ID：master / uav1 / uav2 / uav4 -->
+    <arg name="self_id" default="uav4"/>
+
+    <!-- master 需要等待的 slave 列表，一般不包含 master -->
+    <arg name="participants" default="uav4"/>
+
+    <!-- 本次测试 run_id，所有机器保持一致 -->
+    <arg name="run_id" default="sync_test_001"/>
+
+    <arg name="control_rate_hz" default="50.0"/>
+
+    <!-- ===================================================== -->
+    <!-- 最小测试节点：模拟 task_fsm_node                        -->
+    <!-- ===================================================== -->
+
+    <node pkg="aofe_star"
+          type="minimal_sync_test_node.py"
+          name="$(arg self_id)_minimal_sync_test"
+          output="screen">
+
+        <param name="role" value="$(arg role)"/>
+        <param name="self_id" value="$(arg self_id)"/>
+
+        <param name="loop_rate" value="$(arg control_rate_hz)"/>
+        <param name="test_status_rate" value="10.0"/>
+        <param name="test_request_rate" value="1.0"/>
+
+        <!-- 同步动作名，两边必须一致 -->
+        <param name="action_name" value="test_sync"/>
+
+        <!-- RUNNING 保持几秒后自动 DONE，然后 reset READY -->
+        <param name="test_duration" value="3.0"/>
+        <param name="auto_reset" value="true"/>
+
+        <!-- 和 sync_gate_node 的本机通信 topic -->
+        <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
+        <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
+        <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
+
+        <!-- master 触发同步测试 -->
+        <param name="start_topic" value="/$(arg self_id)/sync_test/start"/>
+
+        <!-- 测试结果输出 -->
+        <param name="result_topic" value="/$(arg self_id)/sync_test/result"/>
+    </node>
+
+    <!-- ===================================================== -->
+    <!-- 同步器节点                                             -->
+    <!-- ===================================================== -->
+
+    <node pkg="aofe_star"
+          type="sync_gate_node.py"
+          name="$(arg self_id)_sync_gate"
+          output="screen">
+
+        <param name="role" value="$(arg role)"/>
+        <param name="self_id" value="$(arg self_id)"/>
+        <param name="participants" value="$(arg participants)"/>
+
+        <param name="run_id" value="$(arg run_id)"/>
+        <param name="run_label" value="sync_test"/>
+
+        <param name="control_rate_hz" value="$(arg control_rate_hz)"/>
+
+        <!-- 收齐 ACK_PREPARE 后生成最终 t0 = now + start_delay -->
+        <param name="start_delay" value="5.0"/>
+        <param name="min_t0_margin" value="1.0"/>
+
+        <param name="task_status_timeout" value="1.0"/>
+        <param name="global_status_timeout" value="2.0"/>
+        <param name="prepare_timeout" value="3.0"/>
+        <param name="commit_timeout" value="3.0"/>
+        <param name="abort_duration" value="2.0"/>
+
+        <!-- 测试阶段先用 5Hz，稳定后可降到 2Hz -->
+        <param name="command_rate" value="5.0"/>
+        <param name="ack_rate" value="5.0"/>
+        <param name="global_status_rate" value="1.0"/>
+
+        <!-- 多机同步器之间的全局 topic -->
+        <param name="command_topic" value="/sync/command"/>
+        <param name="ack_topic" value="/sync/ack"/>
+        <param name="global_status_topic" value="/sync/status"/>
+
+        <!-- 本机 minimal_sync_test_node 与 sync_gate_node 通信 topic -->
+        <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
+        <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
+        <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
+    </node>
+</launch>
