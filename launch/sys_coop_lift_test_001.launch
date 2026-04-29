@@ -1,23 +1,44 @@
 <launch>
+    <!-- ===================================================== -->
+    <!-- 基本身份参数                                          -->
+    <!-- ===================================================== -->
+
     <!-- 当前节点角色：master 或 slave -->
     <arg name="role" default="slave"/>
 
-    <!-- 当前机器 ID：master / uav1 / uav2 / ... -->
-    <arg name="self_id" default="uav1"/>
+    <!-- 当前机器 ID：master / uav1 / uav2 / uav4 ... -->
+    <arg name="self_id" default="uav4"/>
 
-    <!-- master 需要等待的 slave 列表，一般不包含 master -->
-    <arg name="participants" default="uav1,uav2"/>
+    <!--
+        master 需要等待的 slave 列表，一般不包含 master 自己。
+
+        示例：
+        1）单从机 uav4：
+            participants:=uav4
+
+        2）两台从机 uav1 和 uav4：
+            participants:=uav1,uav4
+
+        3）如果当前这台机是 slave，这个参数保持和 master 一致即可。
+    -->
+    <arg name="participants" default="uav4"/>
+    <!-- <arg name="participants" default="uav1,uav4"/> -->
 
     <!-- 本次实验流程 ID，建议所有机器保持一致 -->
     <arg name="run_id" default="coop_lift_test_001"/>
 
-    <!-- 只有 master 的 auto_start 有意义 -->
+    <!-- 只有 master 的 auto_start 有意义；一般建议 false，等待人工 topic 触发 -->
     <arg name="auto_start" default="false"/>
 
+    <!-- 主循环频率 -->
     <arg name="control_rate_hz" default="50.0"/>
 
+    <!-- 是否 demo 模式：true 时部分检查会用时间条件自动通过，实飞建议 false -->
+    <arg name="demo_mode" default="true"/>
+
+
     <!-- ===================================================== -->
-    <!-- 任务状态机节点                                         -->
+    <!-- 任务状态机节点 task_fsm_node                           -->
     <!-- ===================================================== -->
 
     <node pkg="aofe_star"
@@ -25,29 +46,84 @@
           name="$(arg self_id)_task_fsm"
           output="screen">
 
+        <!-- 身份 -->
         <param name="role" value="$(arg role)"/>
         <param name="self_id" value="$(arg self_id)"/>
 
+        <!-- 频率 -->
         <param name="control_rate_hz" value="$(arg control_rate_hz)"/>
         <param name="task_status_rate" value="20.0"/>
         <param name="task_request_rate" value="1.0"/>
+        <param name="mission_state_rate" value="10.0"/>
 
+        <!-- master 是否自动 start -->
         <param name="auto_start" value="$(arg auto_start)"/>
 
+        <!-- demo 模式 -->
+        <param name="demo_mode" value="$(arg demo_mode)"/>
+
+        <!-- 起飞任务参数 -->
         <param name="takeoff_height" value="3.0"/>
         <param name="takeoff_duration" value="6.0"/>
-        <param name="switch_mission_duration" value="2.0"/>
-        <param name="transport_duration" value="8.0"/>
-        <param name="release_duration" value="2.0"/>
+        <param name="takeoff_reached_tolerance" value="0.25"/>
+
+        <!-- 松钩后等待多少秒收绳 -->
+        <param name="hook_to_retract_delay" value="5.0"/>
+
+        <!-- 降落超时 / demo 模式下的落地判据时间 -->
+        <param name="land_timeout" value="30.0"/>
+
+        <!-- ================================================= -->
+        <!-- task_fsm_node 与 sync_gate_node 的本机通信 topic    -->
+        <!-- ================================================= -->
 
         <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
         <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
         <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
+
+        <!-- master 外部启动任务流程 -->
         <param name="start_topic" value="/$(arg self_id)/task/start"/>
+
+        <!-- ================================================= -->
+        <!-- 给其他模块看的任务状态 / 控制接口                   -->
+        <!-- ================================================= -->
+
+        <!-- 任务状态发布，方便轨迹规划器、控制器、监控节点订阅 -->
+        <param name="mission_state_topic" value="/$(arg self_id)/mission/state"/>
+
+        <!-- 给轨迹规划器的请求，例如同步起飞后规划原地起飞轨迹 -->
+        <param name="planner_request_topic" value="/$(arg self_id)/planner/request"/>
+
+        <!-- 给独立控制器的模式/任务命令，控制器再通过 MAVROS 发 PX4 线速度 -->
+        <param name="controller_command_topic" value="/$(arg self_id)/controller/command"/>
+
+        <!-- 给松钩/收绳执行器的命令 -->
+        <param name="hook_command_topic" value="/$(arg self_id)/hook/command"/>
+
+        <!-- ================================================= -->
+        <!-- 人工指令 topic                                     -->
+        <!-- ================================================= -->
+
+        <!-- 人工确认同步起飞：master 收到后发起 takeoff 同步 -->
+        <param name="operator_takeoff_topic" value="/operator/takeoff"/>
+
+        <!-- 到达高度后，人工确认进入主机人工控制 / 从机跟随阶段，不走同步 -->
+        <param name="operator_enter_follow_topic" value="/operator/enter_follow"/>
+
+        <!-- 人工触发松钩 + 5s 后收绳，不走同步 -->
+        <param name="operator_hook_sequence_topic" value="/operator/hook_sequence"/>
+
+        <!-- 人工触发同步降落：master 收到后发起 land 同步 -->
+        <param name="operator_land_topic" value="/operator/land"/>
+
+        <!-- 紧急软件 HOLD -->
+        <param name="operator_emergency_hold_topic" value="/operator/emergency_hold"/>
+
     </node>
 
+
     <!-- ===================================================== -->
-    <!-- 同步器节点                                             -->
+    <!-- 同步器节点 sync_gate_node                              -->
     <!-- ===================================================== -->
 
     <node pkg="aofe_star"
@@ -55,36 +131,58 @@
           name="$(arg self_id)_sync_gate"
           output="screen">
 
+        <!-- 身份 -->
         <param name="role" value="$(arg role)"/>
         <param name="self_id" value="$(arg self_id)"/>
         <param name="participants" value="$(arg participants)"/>
 
+        <!-- 本次实验流程 ID -->
         <param name="run_id" value="$(arg run_id)"/>
         <param name="run_label" value="coop_lift_test"/>
 
+        <!-- 同步器内部 tick 频率 -->
         <param name="control_rate_hz" value="$(arg control_rate_hz)"/>
 
-        <!-- 最终 t0 在收齐 ACK_PREPARE 后生成：t0 = now + start_delay -->
+        <!--
+            最终 t0 在 master 收齐 ACK_PREPARE 后生成：
+                t0 = now + start_delay
+        -->
         <param name="start_delay" value="5.0"/>
         <param name="min_t0_margin" value="1.0"/>
 
+        <!-- 本机 task_fsm 状态超时 -->
         <param name="task_status_timeout" value="1.0"/>
+
+        <!-- master 判断 slave /sync/status 是否过期 -->
         <param name="global_status_timeout" value="2.0"/>
+
+        <!-- PREPARE 阶段等待 ACK_PREPARE 的最长时间 -->
         <param name="prepare_timeout" value="3.0"/>
+
+        <!-- COMMIT 阶段等待 ACK_COMMIT 的最长时间 -->
         <param name="commit_timeout" value="3.0"/>
+
+        <!-- ABORT 重复广播持续时间 -->
         <param name="abort_duration" value="2.0"/>
 
-        <!-- 机间带宽宝贵时，global_status_rate 建议低频 -->
+        <!--
+            机间带宽宝贵时：
+            command_rate / ack_rate 不需要太高，5Hz 足够。
+            global_status_rate 可以低频，1Hz 用于预检查。
+        -->
         <param name="command_rate" value="5.0"/>
         <param name="ack_rate" value="5.0"/>
         <param name="global_status_rate" value="1.0"/>
 
+        <!-- 多机同步器之间的全局 topic -->
         <param name="command_topic" value="/sync/command"/>
         <param name="ack_topic" value="/sync/ack"/>
         <param name="global_status_topic" value="/sync/status"/>
 
+        <!-- 本机 task_fsm_node 与 sync_gate_node 的通信 topic -->
         <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
         <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
         <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
+
     </node>
 </launch>
