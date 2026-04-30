@@ -36,6 +36,9 @@
     <!-- 是否 demo 模式：true 时部分检查会用时间条件自动通过，实飞建议 false -->
     <arg name="demo_mode" default="true"/>
 
+    <!-- 向其他节点发送起飞参数的最大次数，超过后不再发，实飞建议 10 次就好，防止发的太多 -->
+    <arg name="max_send_count" default="10"/>
+
     <!-- ================================================= -->
     <!-- 自检开关                                          -->
     <!-- ================================================= -->
@@ -258,7 +261,7 @@
     <arg name="log_output" default="screen" />
     <arg name="fcu_protocol" default="v2.0" />
     <arg name="respawn_mavros" default="false" />
-    <group ns="$(arg self_id)">
+    <!-- <group ns="$(arg self_id)">
         <include file="$(find mavros)/launch/px4.launch" >
             <arg name="fcu_url" value="$(arg fcu_url)" />
             <arg name="gcs_url" value="$(arg gcs_url)" />
@@ -268,7 +271,7 @@
             <arg name="fcu_protocol" value="$(arg fcu_protocol)" />
             <arg name="respawn_mavros" value="$(arg respawn_mavros)" />
         </include>
-    </group>
+    </group> -->
 
 
 </launch>

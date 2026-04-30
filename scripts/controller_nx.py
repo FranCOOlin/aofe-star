@@ -140,7 +140,7 @@ class Control_loop():
         self.Follower_vel_z = data.twist.twist.linear.z
         self.state_ready = True
 
-    def state_callback(self, data):
+    def Leader_state_callback(self, data):
         self.current_mode = data.mode
 
     def Run(self):

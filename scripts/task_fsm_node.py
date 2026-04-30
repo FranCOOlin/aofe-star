@@ -211,6 +211,10 @@ class TaskFSMNode:
             "~hook_command_topic",
             f"/{self.self_id}/hook/command",
         )
+        self.takeoff_param_topic = rospy.get_param(
+            "~takeoff_param_topic",
+            f"/{self.self_id}/takeoff/param",
+        )
 
         # ========================================================
         # 人工指令 topic
@@ -272,7 +276,8 @@ class TaskFSMNode:
         # demo 模式：
         # 如果没有接真实高度、落地检测，可以先用时间自动通过部分判断。
         self.demo_mode = bool(rospy.get_param("~demo_mode", False))
-
+        self.max_send_count = int(rospy.get_param("~max_send_count", 10))
+        self.send_count = 0
         # ========================================================
         # 自检相关参数
         # ========================================================
@@ -517,6 +522,12 @@ class TaskFSMNode:
 
         self.hook_command_pub = rospy.Publisher(
             self.hook_command_topic,
+            String,
+            queue_size=20,
+        )
+        # 发布起飞相关参数给轨迹规划器
+        self.takeoff_param_pub = rospy.Publisher(
+            self.takeoff_param_topic,
             String,
             queue_size=20,
         )
@@ -1173,6 +1184,33 @@ class TaskFSMNode:
             t0 = float(event.get("t0", 0.0))
         except Exception:
             return
+        
+        # 如果约定好起飞则发送起飞参数给轨迹规划器
+        if event.get("action", "") == "takeoff" and self.send_count < self.max_send_count:
+            self.send_count += 1
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+
+            sync_id = event.get("sync_id", "")
+            action = event.get("action", "")
+            t0 = float(event.get("t0", 0.0))
+
+            data = {
+                "src": self.self_id,
+                "stamp": now_sec(),
+                "action": action,
+                "sync_id": sync_id,
+                "t0": t0,
+                "payload": {
+                    "takeoff_height": float(payload.get("height", self.takeoff_height)),
+                    "takeoff_duration": float(payload.get("duration", self.takeoff_duration)),
+                },
+            }
+
+            self.takeoff_param_pub.publish(
+                String(data=json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+            )
 
         if t0 <= 0:
             return
@@ -1209,6 +1247,7 @@ class TaskFSMNode:
                 pass
 
         self._start_action_from_event(event)
+        self.send_count = 0
 
     def _start_action_from_event(self, event: dict):
         """

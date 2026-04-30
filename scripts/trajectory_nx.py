@@ -2,8 +2,11 @@
 #coding=utf-8
 import rospy
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
+import json
+from typing import Any, Dict, Optional
 # 当收到起飞时间戳(通过geometry_msgs/TwistStamped中的header.stamp,话题:self.uav_id + '/takeoff_time')
 # 即得到起飞标志位，发送带有反馈的预设轨迹（位置+速度）。接收主机高度。接收自身高度,接收自身水平位置。发送格式:nav_msgs/Odometry,话题:self.uav_id + '/trajectory' 
 # 接收格式:PoseStamped,话题:self.uav_id + '/mavros/local_position/pose'
@@ -18,6 +21,7 @@ class Trajectory():
         self.takeoff_flag = False
         self.takeoff_init_finished = False
         self.takeoff_start_time = None
+        self.action = None
         self.takeoff_duration = 5.0 # 起飞持续时间
         self.adjust_kp = 0.5 # 反馈参数
         self.target_height = 4.0 # 期望高度
@@ -37,6 +41,10 @@ class Trajectory():
         self.rate = rospy.Rate(self.trajectory_rate)
         self.uav_id = rospy.get_param('~self_id','')
         self.role = rospy.get_param('~role','')
+        self.takeoff_param_topic = rospy.get_param(
+            "~takeoff_param_topic",
+            f"/{self.uav_id}/takeoff/param",
+        )
 
         if self.role == 'master':
             self.uav_id = '/master'
@@ -50,13 +58,17 @@ class Trajectory():
         self.state_odom = Odometry()
         self.target_odom = Odometry()
 
+        rospy.Subscriber(
+            self.takeoff_param_topic,
+            String,
+            self._takeoff_param_cb,
+            queue_size = 50,
+        )
         if self.uav_id == '/master':
-            rospy.Subscriber(self.uav_id + '/takeoff_time', TwistStamped, self.takeoff_time_callback)
             rospy.Subscriber('/master/mavros/state', State, self.Leader_state_callback)
             rospy.Subscriber("/master/mavros/local_position/pose", PoseStamped, self.Leader_pose_callback)
             rospy.Subscriber("/master/mavros/local_position/velocity_local", TwistStamped, self.Leader_vel_callback)
         else:
-            rospy.Subscriber(self.uav_id + '/takeoff_time', TwistStamped, self.takeoff_time_callback)
             rospy.Subscriber('/master/mavros/state', State, self.Leader_state_callback)
             rospy.Subscriber("/master/mavros/local_position/pose", PoseStamped, self.Leader_pose_callback)
             rospy.Subscriber(self.uav_id + "/mavros/local_position/pose", PoseStamped, self.Follower_pose_callback)
@@ -66,9 +78,49 @@ class Trajectory():
         self.target_pose_and_velocity_pub = rospy.Publisher(self.uav_id + '/trajectory', Odometry, queue_size=1)
         self.pose_and_velocity_pub = rospy.Publisher(self.uav_id + '/state', Odometry, queue_size=1)
 
-    def takeoff_time_callback(self, data):
-        self.takeoff_start_time = data.header.stamp
-        self.takeoff_flag = True
+    def safe_json_loads(self, text: str) -> Optional[dict]:
+        """
+        安全解析 JSON。
+        解析失败时返回 None，避免节点直接崩溃。
+        """
+        try:
+            data = json.loads(text)
+        except Exception as e:
+            rospy.logwarn("json loads failed: %s, raw=%s", str(e), text)
+            return None
+
+        if not isinstance(data, dict):
+            rospy.logwarn("json root is not dict, raw=%s", text)
+            return None
+
+        return data
+
+    def _takeoff_param_cb(self, msg: String):
+        """
+        接收 JSON 消息。
+        """
+        data = self.safe_json_loads(msg.data)
+        if data is None:
+            return
+
+        action = data.get("action", "takeoff")
+        height = float(data.get("height", 3.0))
+        duration = data.get("duration", 6.0)
+        t0 = data.get("t0", 1777475562.439756)
+        self.action = action
+        self.target_height = height
+        self.takeoff_duration = duration
+        self.takeoff_start_time = t0
+        if self.action == "takeoff":
+            self.takeoff_flag = True
+
+        rospy.loginfo(
+            "action=%s height=%.3f duration=%s t=%s",
+            action,
+            height,
+            duration,
+            t0
+        )
 
     def Leader_state_callback(self, data):
         self.Leader_current_mode = data.mode
@@ -117,7 +169,6 @@ class Trajectory():
         if self.uav_id == '/master':
             rospy.wait_for_message('/master/mavros/local_position/pose', PoseStamped)
             rospy.wait_for_message("/master/mavros/local_position/velocity_local", TwistStamped)
-            rospy.wait_for_message(self.uav_id + '/takeoff_time', TwistStamped)
             rospy.wait_for_message('/master/mavros/state', State)
             rospy.loginfo("Leader trajectory node start.")
             while not rospy.is_shutdown():
@@ -128,7 +179,7 @@ class Trajectory():
                         self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
                         self.takeoff_init_finished = True
 
-                    t = (rospy.Time.now() - self.takeoff_start_time).to_sec()
+                    t = rospy.Time.now().to_sec() - self.takeoff_start_time
                     self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
                     self.target_odom = self.set_height(t, self.takeoff_duration, self.initial_pose_x_Leader, self.initial_pose_y_Leader, self.target_height, self.Leader_relative_z, self.Leader_relative_z)  # 是Leader时自己减自己相当于不用反馈
                     self.target_odom.header.stamp = rospy.Time.now()
@@ -151,7 +202,6 @@ class Trajectory():
             rospy.wait_for_message(self.uav_id + '/mavros/local_position/pose', PoseStamped)
             rospy.wait_for_message("/master/mavros/local_position/velocity_local", TwistStamped)
             rospy.wait_for_message(self.uav_id + '/mavros/local_position/velocity_local', TwistStamped)
-            rospy.wait_for_message(self.uav_id + '/takeoff_time', TwistStamped)
             rospy.wait_for_message('/master/mavros/state', State)
             rospy.loginfo("Follower trajectory node start.")
             while not rospy.is_shutdown():
@@ -167,7 +217,7 @@ class Trajectory():
                         self.offset_y = self.initial_pose_y - self.initial_pose_y_Leader
                         self.takeoff_init_finished = True
 
-                    t = (rospy.Time.now() - self.takeoff_start_time).to_sec()
+                    t = rospy.Time.now().to_sec() - self.takeoff_start_time
                     self.Follower_relative_z = self.Follower_pose.pose.position.z - self.initial_pose_z
                     self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
                     self.target_odom = self.set_height(t, self.takeoff_duration, self.initial_pose_x, self.initial_pose_y, self.target_height, self.Leader_relative_z, self.Follower_relative_z) 
