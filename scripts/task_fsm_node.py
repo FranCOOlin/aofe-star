@@ -45,11 +45,18 @@ task_fsm_node.py
 """
 
 import json
+import math
 from typing import Any, Dict, Optional, Callable
 
 import rospy
 from std_msgs.msg import String, Bool
+from sensor_msgs.msg import NavSatFix
+from mavros_msgs.msg import State, RCIn
 
+try:
+    from mavros_msgs.msg import EstimatorStatus
+except ImportError:
+    EstimatorStatus = None
 
 # ============================================================
 # sync_gate_node -> task_fsm_node 的事件类型
@@ -264,7 +271,137 @@ class TaskFSMNode:
 
         # demo 模式：
         # 如果没有接真实高度、落地检测，可以先用时间自动通过部分判断。
-        self.demo_mode = bool(rospy.get_param("~demo_mode", True))
+        self.demo_mode = bool(rospy.get_param("~demo_mode", False))
+
+        # ========================================================
+        # 自检相关参数
+        # ========================================================
+
+        # 注意：
+        # demo_mode=True 时，默认绕过真实自检，方便你跑自动流程测试。
+        # 实飞或者半实物联调时建议：
+        #   demo_mode:=false
+        #   self_check_bypass:=false
+        self.self_check_bypass = bool(
+            rospy.get_param("~self_check_bypass", self.demo_mode)
+        )
+
+        self.require_mavros_connected = bool(
+            rospy.get_param("~require_mavros_connected", True)
+        )
+        self.require_gps = bool(rospy.get_param("~require_gps", True))
+        self.require_ekf = bool(rospy.get_param("~require_ekf", True))
+        self.require_rc = bool(rospy.get_param("~require_rc", True))
+
+        # 各类消息超时时间
+        self.mavros_state_timeout = float(
+            rospy.get_param("~mavros_state_timeout", 1.0)
+        )
+        self.gps_timeout = float(rospy.get_param("~gps_timeout", 1.0))
+        self.ekf_timeout = float(rospy.get_param("~ekf_timeout", 1.0))
+        self.rc_timeout = float(rospy.get_param("~rc_timeout", 1.0))
+
+        # GPS 最低 fix 状态：
+        # NavSatStatus.STATUS_NO_FIX = -1
+        # NavSatStatus.STATUS_FIX    = 0
+        # NavSatStatus.STATUS_SBAS_FIX = 1
+        # NavSatStatus.STATUS_GBAS_FIX = 2
+        #
+        # 一般要求普通 GPS fix 用 0；
+        # 如果你希望更严格，比如 RTK/GBAS，可以设成 2。
+        self.gps_min_status = int(rospy.get_param("~gps_min_status", 0))
+
+        # 遥控器检查
+        self.rc_min_channels = int(rospy.get_param("~rc_min_channels", 4))
+
+        # rc_min_rssi < 0 表示不检查 rssi，只检查 RCIn 是否新鲜、通道是否存在。
+        # 因为有些接收机/链路 rssi 可能一直是 0 或未定义。
+        self.rc_min_rssi = int(rospy.get_param("~rc_min_rssi", -1))
+
+        # EKF2 状态检查项
+        self.require_ekf_attitude = bool(
+            rospy.get_param("~require_ekf_attitude", True)
+        )
+        self.require_ekf_vel_horiz = bool(
+            rospy.get_param("~require_ekf_vel_horiz", True)
+        )
+        self.require_ekf_vel_vert = bool(
+            rospy.get_param("~require_ekf_vel_vert", True)
+        )
+        self.require_ekf_pos_horiz_abs = bool(
+            rospy.get_param("~require_ekf_pos_horiz_abs", True)
+        )
+        self.require_ekf_pos_vert_abs = bool(
+            rospy.get_param("~require_ekf_pos_vert_abs", False)
+        )
+
+        self.reject_ekf_gps_glitch = bool(
+            rospy.get_param("~reject_ekf_gps_glitch", True)
+        )
+        self.reject_ekf_accel_error = bool(
+            rospy.get_param("~reject_ekf_accel_error", True)
+        )
+
+        # 自检日志打印限频
+        self.self_check_log_period = float(
+            rospy.get_param("~self_check_log_period", 1.0)
+        )
+        self.last_self_check_log_time = 0.0
+
+        # MAVROS topic，可以根据你的命名空间调整。
+        # 如果每台飞机的 mavros 都在 /mavros 下，就保持默认。
+        # 如果是 /uav4/mavros，需要在 launch 里改。
+        self.mavros_state_topic = rospy.get_param(
+            "~mavros_state_topic",
+            f"/{self.self_id}/mavros/state",
+        )
+
+        self.gps_topic = rospy.get_param(
+            "~gps_topic",
+            f"/{self.self_id}/mavros/global_position/global",
+        )
+
+        self.estimator_status_topic = rospy.get_param(
+            "~estimator_status_topic",
+            f"/{self.self_id}/mavros/estimator_status",
+        )
+
+        self.rc_in_topic = rospy.get_param(
+            "~rc_in_topic",
+            f"/{self.self_id}/mavros/rc/in",
+        )
+
+        # ========================================================
+        # 自检状态缓存
+        # ========================================================
+
+        self.last_mavros_state_time = 0.0
+        self.mavros_connected = False
+        self.mavros_mode = ""
+        self.mavros_armed = False
+
+        self.last_gps_time = 0.0
+        self.gps_fix_status = -1
+        self.gps_lat = float("nan")
+        self.gps_lon = float("nan")
+        self.gps_alt = float("nan")
+
+        self.last_ekf_time = 0.0
+        self.ekf_flags = {
+            "attitude": False,
+            "vel_horiz": False,
+            "vel_vert": False,
+            "pos_horiz_abs": False,
+            "pos_vert_abs": False,
+            "gps_glitch": False,
+            "accel_error": False,
+        }
+
+        self.last_rc_time = 0.0
+        self.rc_channels = []
+        self.rc_rssi = 0
+
+        self.self_check_report: Dict[str, Any] = {}
 
         # ========================================================
         # 人工指令标志位
@@ -1005,25 +1142,73 @@ class TaskFSMNode:
         """
         收到 SCHEDULED 后，根据 t0 自己启动任务。
 
-        这样比等待 START 消息更准。
-        START 仍然作为兜底事件存在。
+        原始逻辑：
+            每次 FSM tick 判断 now >= t0，到了就启动。
+
+        改进逻辑：
+            1. 距离 t0 还远时，不阻塞，直接返回；
+            2. 距离 t0 进入 precise_wait_window 秒以内时，短暂进入精细等待；
+            3. 最后 busy_wait_window 秒以内不 sleep，busy wait，尽量贴近 t0 触发。
+
+        注意：
+            - 这里最多会在 t0 前阻塞 precise_wait_window 秒，默认 20ms；
+            - 只适合临近同步触发时使用；
+            - START 事件仍然作为兜底事件；
+            - 同一个 sync_id 的重复启动由 _start_action_from_event() 里的 started_sync_ids 负责防重。
         """
         if self.scheduled_event is None:
             return
 
-        action = self.scheduled_event.get("action", "")
+        # 先缓存事件，避免等待过程中 self.scheduled_event 被其他路径清空。
+        event = self.scheduled_event
+
+        action = event.get("action", "")
         expected = self.expected_action()
 
+        # 当前状态已经不是等待这个 action 的状态，说明事件过期或状态已变化。
         if action != expected:
             return
 
-        t0 = float(self.scheduled_event.get("t0", 0.0))
+        try:
+            t0 = float(event.get("t0", 0.0))
+        except Exception:
+            return
 
         if t0 <= 0:
             return
 
-        if now_sec() >= t0:
-            self._start_action_from_event(self.scheduled_event)
+        # 可以通过 launch 参数调整。
+        # precise_wait_window: 距离 t0 多近时进入精细等待，默认 20ms。
+        # busy_wait_window: 最后多长时间 busy wait，默认 2ms。
+        # sleep_step: 精细等待阶段的短 sleep 步长，默认 0.5ms。
+        precise_wait_window = float(rospy.get_param("~precise_wait_window", 0.020))
+        busy_wait_window = float(rospy.get_param("~busy_wait_window", 0.002))
+        sleep_step = float(rospy.get_param("~precise_wait_sleep_step", 0.0005))
+
+        now = now_sec()
+        remain = t0 - now
+
+        # 离 t0 还远，不要阻塞主循环。
+        if remain > precise_wait_window:
+            return
+
+        # 进入 t0 前的小时间窗，开始精细等待。
+        while not rospy.is_shutdown():
+            now = now_sec()
+            remain = t0 - now
+
+            if remain <= 0:
+                break
+
+            # 还剩 2ms 以上，用短 sleep，降低 CPU 占用。
+            if remain > busy_wait_window:
+                rospy.sleep(min(sleep_step, max(remain - busy_wait_window, 0.0)))
+            else:
+                # 最后 busy_wait_window 秒 busy wait。
+                # 不 sleep，尽量减少调度误差。
+                pass
+
+        self._start_action_from_event(event)
 
     def _start_action_from_event(self, event: dict):
         """
@@ -1254,24 +1439,227 @@ class TaskFSMNode:
     # 条件判断：你主要改这里
     # ============================================================
 
+    def _is_fresh(self, stamp: float, timeout: float) -> bool:
+        """
+        判断某个 topic 是否在 timeout 内更新过。
+        """
+        return stamp > 0.0 and (now_sec() - stamp) <= timeout
+
+    def _check_gps_ok(self) -> bool:
+        """
+        GPS 检查：
+            1. GPS topic 新鲜；
+            2. fix status >= gps_min_status；
+            3. 经纬高为有限数。
+        """
+        if not self.require_gps:
+            return True
+
+        gps_fresh = self._is_fresh(self.last_gps_time, self.gps_timeout)
+
+        gps_fix_ok = self.gps_fix_status >= self.gps_min_status
+
+        gps_value_ok = (
+            math.isfinite(self.gps_lat)
+            and math.isfinite(self.gps_lon)
+            and math.isfinite(self.gps_alt)
+        )
+
+        return gps_fresh and gps_fix_ok and gps_value_ok
+
+    def _check_ekf_ok(self) -> bool:
+        """
+        EKF2 检查：
+            1. estimator_status topic 新鲜；
+            2. 必要 flags 为 True；
+            3. 没有 gps_glitch / accel_error。
+        """
+        if not self.require_ekf:
+            return True
+
+        ekf_fresh = self._is_fresh(self.last_ekf_time, self.ekf_timeout)
+        if not ekf_fresh:
+            return False
+
+        required_checks = []
+
+        if self.require_ekf_attitude:
+            required_checks.append(self.ekf_flags["attitude"])
+
+        if self.require_ekf_vel_horiz:
+            required_checks.append(self.ekf_flags["vel_horiz"])
+
+        if self.require_ekf_vel_vert:
+            required_checks.append(self.ekf_flags["vel_vert"])
+
+        if self.require_ekf_pos_horiz_abs:
+            required_checks.append(self.ekf_flags["pos_horiz_abs"])
+
+        if self.require_ekf_pos_vert_abs:
+            required_checks.append(self.ekf_flags["pos_vert_abs"])
+
+        if required_checks and not all(required_checks):
+            return False
+
+        if self.reject_ekf_gps_glitch and self.ekf_flags["gps_glitch"]:
+            return False
+
+        if self.reject_ekf_accel_error and self.ekf_flags["accel_error"]:
+            return False
+
+        return True
+
+    def _check_rc_ok(self) -> bool:
+        """
+        遥控器检查：
+            1. /mavros/rc/in topic 新鲜；
+            2. 通道数足够；
+            3. 如果配置了 rc_min_rssi，则 rssi 达标。
+        """
+        if not self.require_rc:
+            return True
+
+        rc_fresh = self._is_fresh(self.last_rc_time, self.rc_timeout)
+
+        channels_ok = len(self.rc_channels) >= self.rc_min_channels
+
+        if self.rc_min_rssi >= 0:
+            rssi_ok = self.rc_rssi >= self.rc_min_rssi
+        else:
+            rssi_ok = True
+
+        return rc_fresh and channels_ok and rssi_ok
+
+    def _check_mavros_ok(self) -> bool:
+        """
+        MAVROS 连接检查。
+        """
+        if not self.require_mavros_connected:
+            return True
+
+        state_fresh = self._is_fresh(
+            self.last_mavros_state_time,
+            self.mavros_state_timeout,
+        )
+
+        return state_fresh and self.mavros_connected
+
+    def _build_self_check_report(self) -> Dict[str, Any]:
+        """
+        生成自检报告，方便日志和 /mission/state 查看。
+        """
+        gps_fresh = self._is_fresh(self.last_gps_time, self.gps_timeout)
+        ekf_fresh = self._is_fresh(self.last_ekf_time, self.ekf_timeout)
+        rc_fresh = self._is_fresh(self.last_rc_time, self.rc_timeout)
+        mavros_fresh = self._is_fresh(
+            self.last_mavros_state_time,
+            self.mavros_state_timeout,
+        )
+
+        gps_ok = self._check_gps_ok()
+        ekf_ok = self._check_ekf_ok()
+        rc_ok = self._check_rc_ok()
+        mavros_ok = self._check_mavros_ok()
+
+        report = {
+            "bypass": self.self_check_bypass,
+            "mavros": {
+                "required": self.require_mavros_connected,
+                "fresh": mavros_fresh,
+                "connected": self.mavros_connected,
+                "mode": self.mavros_mode,
+                "armed": self.mavros_armed,
+                "ok": mavros_ok,
+            },
+            "gps": {
+                "required": self.require_gps,
+                "fresh": gps_fresh,
+                "fix_status": self.gps_fix_status,
+                "min_status": self.gps_min_status,
+                "lat": self.gps_lat,
+                "lon": self.gps_lon,
+                "alt": self.gps_alt,
+                "ok": gps_ok,
+            },
+            "ekf": {
+                "required": self.require_ekf,
+                "fresh": ekf_fresh,
+                "flags": dict(self.ekf_flags),
+                "ok": ekf_ok,
+            },
+            "rc": {
+                "required": self.require_rc,
+                "fresh": rc_fresh,
+                "channels_count": len(self.rc_channels),
+                "min_channels": self.rc_min_channels,
+                "rssi": self.rc_rssi,
+                "min_rssi": self.rc_min_rssi,
+                "ok": rc_ok,
+            },
+        }
+
+        report["ok"] = (
+            mavros_ok
+            and gps_ok
+            and ekf_ok
+            and rc_ok
+        )
+
+        return report
+
     def check_self_check_passed(self) -> bool:
         """
         自检是否通过。
 
-        你可以在这里检查：
-            - MAVROS 是否连接
-            - 飞控状态是否正常
-            - 定位是否有效
-            - 控制器节点是否在线
-            - 轨迹规划器是否在线
-            - 电池/氢电系统是否正常
-            - 钩子/绞盘是否正常
+        当前检查：
+            1. MAVROS 是否连接；
+            2. GPS 是否有 fix；
+            3. EKF2 状态是否正常；
+            4. 是否有遥控器接入。
+
+        注意：
+            demo_mode=True 时，self_check_bypass 默认也是 True。
+            实飞时请设置：
+                demo_mode:=false
+                self_check_bypass:=false
         """
-        if self.demo_mode:
+        if self.self_check_bypass:
+            self.self_check_report = {
+                "ok": True,
+                "bypass": True,
+                "reason": "self_check_bypass_enabled",
+            }
             return True
 
-        # TODO: 替换为真实自检逻辑
-        return False
+        self.self_check_report = self._build_self_check_report()
+        ok = bool(self.self_check_report.get("ok", False))
+
+        t = now_sec()
+        if not ok and t - self.last_self_check_log_time >= self.self_check_log_period:
+            self.last_self_check_log_time = t
+            rospy.logwarn(
+                "[%s TaskFSM] self check not passed: %s",
+                self.self_id,
+                json.dumps(
+                    self.self_check_report,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
+        if ok and t - self.last_self_check_log_time >= self.self_check_log_period:
+            self.last_self_check_log_time = t
+            rospy.loginfo(
+                "[%s TaskFSM] self check passed: %s",
+                self.self_id,
+                json.dumps(
+                    self.self_check_report,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
+        return ok
 
     def check_takeoff_reached(self, tau: float) -> bool:
         """
@@ -1455,6 +1843,7 @@ class TaskFSMNode:
             "hook_released": self.hook_released,
             "rope_retracted": self.rope_retracted,
             "emergency_hold": self.task_state == self.TASK_EMERGENCY_HOLD,
+            "self_check": self.self_check_report,# 新增：自检结果
         }
 
         self.mission_state_pub.publish(

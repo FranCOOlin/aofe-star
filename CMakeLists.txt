@@ -162,8 +162,10 @@ include_directories(
 catkin_install_python(PROGRAMS
    scripts/sync_gate_node.py
    scripts/task_fsm_node.py
-   scripts/minimal_sync_test_node.py
-   scripts/fsm_auto_test.py
+   scripts/test/minimal_sync_test_node.py
+   scripts/test/fsm_auto_test.py
+   scripts/trajectory_nx.py
+   scripts/controller_nx.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )
 

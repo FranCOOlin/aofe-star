@@ -36,6 +36,48 @@
     <!-- 是否 demo 模式：true 时部分检查会用时间条件自动通过，实飞建议 false -->
     <arg name="demo_mode" default="true"/>
 
+    <!-- ================================================= -->
+    <!-- 自检开关                                          -->
+    <!-- ================================================= -->
+
+    <!-- 实飞建议 false；自动流程测试可以 true -->
+    <param name="self_check_bypass" value="false"/>
+
+    <param name="require_mavros_connected" value="true"/>
+    <param name="require_gps" value="true"/>
+    <param name="require_ekf" value="true"/>
+    <param name="require_rc" value="true"/>
+
+    <param name="mavros_state_timeout" value="1.0"/>
+    <param name="gps_timeout" value="1.0"/>
+    <param name="ekf_timeout" value="1.0"/>
+    <param name="rc_timeout" value="1.0"/>
+
+    <!-- 普通 GPS fix 用 0；更严格可设为 2 -->
+    <param name="gps_min_status" value="0"/>
+
+    <!-- 遥控器至少 4 通道 -->
+    <param name="rc_min_channels" value="4"/>
+
+    <!-- -1 表示不检查 RSSI，只检查 RCIn 新鲜和通道数 -->
+    <param name="rc_min_rssi" value="-1"/>
+
+    <!-- EKF2 检查项 -->
+    <param name="require_ekf_attitude" value="true"/>
+    <param name="require_ekf_vel_horiz" value="true"/>
+    <param name="require_ekf_vel_vert" value="true"/>
+    <param name="require_ekf_pos_horiz_abs" value="true"/>
+    <param name="require_ekf_pos_vert_abs" value="false"/>
+    <param name="reject_ekf_gps_glitch" value="true"/>
+    <param name="reject_ekf_accel_error" value="true"/>
+
+    <!-- MAVROS topic。如果每台机都有命名空间，这里要改 -->
+    <param name="mavros_state_topic" value="/$(arg self_id)/mavros/state"/>
+    <param name="gps_topic" value="/$(arg self_id)/mavros/global_position/global"/>
+    <param name="estimator_status_topic" value="/$(arg self_id)/mavros/estimator_status"/>
+    <param name="rc_in_topic" value="/$(arg self_id)/mavros/rc/in"/>
+
+    <param name="self_check_log_period" value="1.0"/>
 
     <!-- ===================================================== -->
     <!-- 任务状态机节点 task_fsm_node                           -->
@@ -185,4 +227,48 @@
         <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
 
     </node>
+
+    <!-- ===================================================== -->
+    <!-- 轨迹与控制节点                                         -->
+    <!-- ===================================================== -->
+    <node pkg="aofe_star"
+          type="trajectory_nx.py"
+          name="$(arg self_id)_trajectory"
+          output="screen">
+        <param name="self_id" value="$(arg self_id)"/>
+        <param name="role" value="$(arg role)"/>
+    </node>
+
+    <node pkg="aofe_star"
+          type="controller_nx.py"
+          name="$(arg self_id)_controller"
+          output="screen">
+        <param name="self_id" value="$(arg self_id)"/>
+        <param name="role" value="$(arg role)"/>
+    </node>
+
+
+    <!-- ===================================================== -->
+    <!-- 启动 px4                                              -->
+    <!-- ===================================================== -->
+    <arg name="fcu_url" default="/dev/ttyUSB0:1000000" />
+    <arg name="gcs_url" default="" />
+    <arg name="tgt_system" default="1" />
+    <arg name="tgt_component" default="1" />
+    <arg name="log_output" default="screen" />
+    <arg name="fcu_protocol" default="v2.0" />
+    <arg name="respawn_mavros" default="false" />
+    <group ns="$(arg self_id)">
+        <include file="$(find mavros)/launch/px4.launch" >
+            <arg name="fcu_url" value="$(arg fcu_url)" />
+            <arg name="gcs_url" value="$(arg gcs_url)" />
+            <arg name="tgt_system" value="$(arg tgt_system)" />
+            <arg name="tgt_component" value="$(arg tgt_component)" />
+            <arg name="log_output" value="$(arg log_output)" />
+            <arg name="fcu_protocol" value="$(arg fcu_protocol)" />
+            <arg name="respawn_mavros" value="$(arg respawn_mavros)" />
+        </include>
+    </group>
+
+
 </launch>
