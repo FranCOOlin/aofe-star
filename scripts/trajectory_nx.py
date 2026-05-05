@@ -278,9 +278,9 @@ class Trajectory():
                     self.initial_pose_y = self.Follower_pose.pose.position.y
                     self.initial_pose_z = self.Follower_pose.pose.position.z
                     self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
-                    roll, pitch, self.initial_Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
                     if self.first_init:
                         self.offset_x, self.offset_y = self.latlon_delta_to_meters(self.lon, self.lat, self.Lead_lon, self.Lead_lat)
+                        roll, pitch, self.initial_Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
                         self.first_init = False
                     rospy.logerr("[%s TrajectoryNode] Follower initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x, self.initial_pose_y, self.initial_pose_z)
                     self.takeoff_init_finished = True

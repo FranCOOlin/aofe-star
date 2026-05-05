@@ -168,6 +168,7 @@ catkin_install_python(PROGRAMS
    scripts/test/task_fsm_single_test.py
    scripts/trajectory_nx.py
    scripts/trajectory_reset_service_template.py
+   scripts/trajectory_reset_three_uav.py
    scripts/controller_nx.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )
