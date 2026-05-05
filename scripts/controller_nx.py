@@ -175,7 +175,7 @@ class Control_loop():
         self.state_ready = True
 
     def yawd_callback(self, data):
-        self.traj_yaw = data
+        self.traj_yaw = data.data
         self.yawd_ready = True
 
     def Leader_state_callback(self, data):
