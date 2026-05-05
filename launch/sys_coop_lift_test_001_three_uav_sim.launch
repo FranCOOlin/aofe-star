@@ -1,0 +1,78 @@
+<launch>
+    <!--
+        三机仿真总启动文件。
+        仅用于单机仿真/联调时一次拉起 uav0/uav1/uav2；
+        真实三机部署时应让每台飞机各自启动 single_sim_template 或对应实机模板。
+    -->
+
+    <arg name="run_id" default="coop_lift_test_001_three_uav_sim"/>
+    <arg name="participants" default="uav1,uav2"/>
+    <arg name="control_rate_hz" default="50.0"/>
+    <arg name="demo_mode" default="false"/>
+    <arg name="master_auto_start" default="true"/>
+    <arg name="max_send_count" default="10"/>
+    <arg name="offboard_permission_source" default="manual_control"/>
+    <arg name="master_offboard_arm_request_delay" default="0.0"/>
+    <arg name="uav1_offboard_arm_request_delay" default="0.4"/>
+    <arg name="uav2_offboard_arm_request_delay" default="0.8"/>
+    <arg name="master_id" default="uav0"/>
+
+    <!--
+        现有 trajectory_nx.py / controller_nx.py 中 master 角色使用 /master 前缀。
+        仿真中把 /master 前缀映射到配置的 master_id。
+    -->
+    <!-- <remap from="/master/mavros/state" to="/$(arg master_id)/mavros/state"/>
+    <remap from="/master/mavros/local_position/pose" to="/$(arg master_id)/mavros/local_position/pose"/>
+    <remap from="/master/mavros/local_position/velocity_local" to="/$(arg master_id)/mavros/local_position/velocity_local"/>
+    <remap from="/master/mavros/setpoint_velocity/cmd_vel_unstamped" to="/$(arg master_id)/mavros/setpoint_velocity/cmd_vel_unstamped"/>
+    <remap from="/master/trajectory" to="/$(arg master_id)/trajectory"/>
+    <remap from="/master/state" to="/$(arg master_id)/state"/> -->
+
+    <!-- master，启动轨迹/控制链路，保证 OFFBOARD 前有 setpoint。 -->
+    <include file="$(find aofe_star)/launch/sys_coop_lift_test_001_single_sim_template.launch">
+        <arg name="role" value="master"/>
+        <arg name="self_id" value="$(arg master_id)"/>
+        <arg name="participants" value="$(arg participants)"/>
+        <arg name="run_id" value="$(arg run_id)"/>
+        <arg name="auto_start" value="$(arg master_auto_start)"/>
+        <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
+        <arg name="demo_mode" value="$(arg demo_mode)"/>
+        <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
+        <arg name="offboard_arm_request_delay" value="$(arg master_offboard_arm_request_delay)"/>
+        <arg name="launch_trajectory" value="true"/>
+        <arg name="launch_controller" value="true"/>
+    </include>
+
+    <!-- uav1: slave，仿真中也启动轨迹/控制链路，保证 OFFBOARD 前有 setpoint。 -->
+    <include file="$(find aofe_star)/launch/sys_coop_lift_test_001_single_sim_template.launch">
+        <arg name="role" value="slave"/>
+        <arg name="self_id" value="uav1"/>
+        <arg name="participants" value="$(arg participants)"/>
+        <arg name="run_id" value="$(arg run_id)"/>
+        <arg name="auto_start" value="false"/>
+        <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
+        <arg name="demo_mode" value="$(arg demo_mode)"/>
+        <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
+        <arg name="offboard_arm_request_delay" value="$(arg uav1_offboard_arm_request_delay)"/>
+        <arg name="launch_trajectory" value="true"/>
+        <arg name="launch_controller" value="true"/>
+    </include>
+
+    <!-- uav2: slave，仿真中也启动轨迹/控制链路，保证 OFFBOARD 前有 setpoint。 -->
+    <include file="$(find aofe_star)/launch/sys_coop_lift_test_001_single_sim_template.launch">
+        <arg name="role" value="slave"/>
+        <arg name="self_id" value="uav2"/>
+        <arg name="participants" value="$(arg participants)"/>
+        <arg name="run_id" value="$(arg run_id)"/>
+        <arg name="auto_start" value="false"/>
+        <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
+        <arg name="demo_mode" value="$(arg demo_mode)"/>
+        <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
+        <arg name="offboard_arm_request_delay" value="$(arg uav2_offboard_arm_request_delay)"/>
+        <arg name="launch_trajectory" value="true"/>
+        <arg name="launch_controller" value="true"/>
+    </include>
+</launch>

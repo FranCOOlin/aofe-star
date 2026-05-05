@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   std_msgs
+  std_srvs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -164,7 +165,9 @@ catkin_install_python(PROGRAMS
    scripts/task_fsm_node.py
    scripts/test/minimal_sync_test_node.py
    scripts/test/fsm_auto_test.py
+   scripts/test/task_fsm_single_test.py
    scripts/trajectory_nx.py
+   scripts/trajectory_reset_service_template.py
    scripts/controller_nx.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )

@@ -51,12 +51,15 @@ from typing import Any, Dict, Optional, Callable
 import rospy
 from std_msgs.msg import String, Bool
 from sensor_msgs.msg import NavSatFix
-from mavros_msgs.msg import State, RCIn
+from mavros_msgs.msg import State, RCIn, ManualControl, ExtendedState
+from std_srvs.srv import Trigger, TriggerResponse
 
 try:
     from mavros_msgs.msg import EstimatorStatus
 except ImportError:
     EstimatorStatus = None
+
+from mavros_msgs.srv import CommandBool, SetMode
 
 # ============================================================
 # sync_gate_node -> task_fsm_node 的事件类型
@@ -161,6 +164,7 @@ class TaskFSMNode:
 
         self.role = rospy.get_param("~role", "slave").lower().strip()
         self.self_id = rospy.get_param("~self_id", "uav1")
+        self.participants = self._parse_csv_param(rospy.get_param("~participants", ""))
 
         if self.role not in ["master", "slave"]:
             raise RuntimeError("~role must be master or slave")
@@ -231,6 +235,13 @@ class TaskFSMNode:
             "~operator_enter_follow_topic",
             "/operator/enter_follow",
         )
+        self.operator_enter_follow_service = rospy.get_param(
+            "~operator_enter_follow_service",
+            f"/{self.self_id}/operator/enter_follow",
+        )
+        self.operator_enter_follow_service_wait_timeout = float(
+            rospy.get_param("~operator_enter_follow_service_wait_timeout", 1.0)
+        )
 
         self.operator_hook_sequence_topic = rospy.get_param(
             "~operator_hook_sequence_topic",
@@ -265,6 +276,16 @@ class TaskFSMNode:
         self.takeoff_duration = float(rospy.get_param("~takeoff_duration", 6.0))
         self.takeoff_reached_tolerance = float(
             rospy.get_param("~takeoff_reached_tolerance", 0.25)
+        )
+        self.trajectory_reset_service = rospy.get_param(
+            "~trajectory_reset_service",
+            f"/{self.self_id}/trajectory/reset",
+        )
+        self.trajectory_reset_service_timeout = float(
+            rospy.get_param("~trajectory_reset_service_timeout", 0.05)
+        )
+        self.trajectory_reset_retry_interval = float(
+            rospy.get_param("~trajectory_reset_retry_interval", 1.0)
         )
 
         self.hook_to_retract_delay = float(
@@ -366,6 +387,11 @@ class TaskFSMNode:
             f"/{self.self_id}/mavros/global_position/global",
         )
 
+        self.extended_state_topic = rospy.get_param(
+            "~extended_state_topic",
+            f"/{self.self_id}/mavros/extended_state",
+        )
+
         self.estimator_status_topic = rospy.get_param(
             "~estimator_status_topic",
             f"/{self.self_id}/mavros/estimator_status",
@@ -374,6 +400,179 @@ class TaskFSMNode:
         self.rc_in_topic = rospy.get_param(
             "~rc_in_topic",
             f"/{self.self_id}/mavros/rc/in",
+        )
+
+        self.manual_control_topic = rospy.get_param(
+            "~manual_control_topic",
+            f"/{self.self_id}/mavros/manual_control/control",
+        )
+
+        # ========================================================
+        # OFFBOARD / ARM 管理参数
+        # ========================================================
+
+        self.enable_offboard_manager = bool(
+            rospy.get_param("~enable_offboard_manager", True)
+        )
+
+        self.auto_offboard = bool(
+            rospy.get_param("~auto_offboard", True)
+        )
+
+        self.auto_arm = bool(
+            rospy.get_param("~auto_arm", True)
+        )
+
+        # OFFBOARD / ARM 管理频率，建议 1~2Hz，不要 50Hz 调服务
+        self.offboard_manage_rate = float(
+            rospy.get_param("~offboard_manage_rate", 2.0)
+        )
+        self.offboard_arm_request_delay = float(
+            rospy.get_param("~offboard_arm_request_delay", 0.0)
+        )
+
+        self.set_mode_min_interval = float(
+            rospy.get_param("~set_mode_min_interval", 1.0)
+        )
+
+        self.arm_min_interval = float(
+            rospy.get_param("~arm_min_interval", 1.0)
+        )
+        self.master_pilot_hold_px4_mode = str(
+            rospy.get_param("~master_pilot_hold_px4_mode", "AUTO.LOITER")
+        ).strip()
+        self.enable_master_pilot_hold_mode = bool(
+            rospy.get_param("~enable_master_pilot_hold_mode", True)
+        )
+        self.emergency_hold_px4_mode = str(
+            rospy.get_param("~emergency_hold_px4_mode", self.master_pilot_hold_px4_mode)
+        ).strip()
+        self.enable_emergency_hold_mode = bool(
+            rospy.get_param("~enable_emergency_hold_mode", True)
+        )
+        self.land_px4_mode = str(
+            rospy.get_param("~land_px4_mode", "AUTO.LAND")
+        ).strip()
+        self.enable_px4_land_mode = bool(
+            rospy.get_param("~enable_px4_land_mode", True)
+        )
+
+        # 收到 takeoff SCHEDULED 后，距离 t0 多少秒开始尝试 OFFBOARD / ARM
+        self.prearm_before_t0 = float(
+            rospy.get_param("~prearm_before_t0", 3.0)
+        )
+
+        # TAKEOFF_READY 且收到 takeoff 指令后，是否提前允许 OFFBOARD
+        self.offboard_in_takeoff_ready_after_cmd = bool(
+            rospy.get_param("~offboard_in_takeoff_ready_after_cmd", True)
+        )
+
+        # 三段拨杆通道，注意：这是遥控器第几通道，不是数组下标
+        # 第 7 通道对应 RCIn.channels[6]
+        self.offboard_switch_channel = int(
+            rospy.get_param("~offboard_switch_channel", 7)
+        )
+
+        # 三段拨杆高位阈值。通常三段为 1000 / 1500 / 2000
+        self.offboard_switch_high_threshold = int(
+            rospy.get_param("~offboard_switch_high_threshold", 1800)
+        )
+
+        # OFFBOARD/ARM 许可来源：
+        #   always         调试用，始终允许程序切 OFFBOARD/ARM。
+        #   rc_in          使用 /mavros/rc/in 的通道阈值逻辑。
+        #   manual_control 使用 /mavros/manual_control/control 的 buttons 位。
+        self.offboard_permission_source = str(
+            rospy.get_param("~offboard_permission_source", "always")
+        ).lower().strip()
+
+        # QGC joystick -> MAVLink MANUAL_CONTROL -> MAVROS ManualControl。
+        # SB 三段开关由 buttons 的 bit7/bit6 编码：10 / 01 / 00。
+        # 这里只允许 00 进入 OFFBOARD/ARM 许可。
+        self.manual_control_timeout = float(
+            rospy.get_param("~manual_control_timeout", self.rc_timeout)
+        )
+        self.manual_control_sb_high_bit = int(
+            rospy.get_param(
+                "~manual_control_sb_high_bit",
+                rospy.get_param("~manual_control_sd_high_bit", 7),
+            )
+        )
+        self.manual_control_sb_low_bit = int(
+            rospy.get_param(
+                "~manual_control_sb_low_bit",
+                rospy.get_param("~manual_control_sd_low_bit", 6),
+            )
+        )
+        # 任务阶段开关，仅 offboard_permission_source=manual_control 时生效。
+        # 这里沿用 MAVROS ManualControl.buttons 的 bit 编号。
+        self.manual_control_sa_bit = int(
+            rospy.get_param("~manual_control_sa_bit", 3)
+        )
+        self.manual_control_sa_active_value = int(
+            rospy.get_param("~manual_control_sa_active_value", 1)
+        )
+        self.manual_control_sd_bit = int(
+            rospy.get_param("~manual_control_sd_bit", 1)
+        )
+        self.manual_control_sd_land_value = int(
+            rospy.get_param("~manual_control_sd_land_value", 1)
+        )
+        self.manual_control_hook_bit = int(
+            rospy.get_param("~manual_control_hook_bit", 2)
+        )
+        self.manual_control_hook_value = int(
+            rospy.get_param("~manual_control_hook_value", 1)
+        )
+        self.rc_task_land_channel = int(
+            rospy.get_param("~rc_task_land_channel", 0)
+        )
+        self.rc_task_hook_channel = int(
+            rospy.get_param("~rc_task_hook_channel", 0)
+        )
+        rc_task_switch_default_threshold = int(
+            rospy.get_param("~rc_task_switch_high_threshold", 1800)
+        )
+        self.rc_task_land_threshold = int(
+            rospy.get_param("~rc_task_land_threshold", rc_task_switch_default_threshold)
+        )
+        self.rc_task_land_direction = str(
+            rospy.get_param("~rc_task_land_direction", "above")
+        ).lower().strip()
+        self.rc_task_hook_threshold = int(
+            rospy.get_param("~rc_task_hook_threshold", rc_task_switch_default_threshold)
+        )
+        self.rc_task_hook_direction = str(
+            rospy.get_param("~rc_task_hook_direction", "above")
+        ).lower().strip()
+
+        # 当前三段拨杆是否允许程序干预,false 表示飞手拨回低/中档，不允许程序切 OFFBOARD；true 表示飞手拨到高位，允许程序切 OFFBOARD。
+        self.rc_offboard_permission = False
+
+        # 内部计时，避免频繁调用服务
+        self.last_offboard_manage_time = 0.0
+        self.last_set_mode_req_time = 0.0
+        self.last_arm_req_time = 0.0
+
+        # MAVROS service，按 self_id 拼接
+        self.set_mode_service = rospy.get_param(
+            "~set_mode_service",
+            f"/{self.self_id}/mavros/set_mode",
+        )
+
+        self.arming_service = rospy.get_param(
+            "~arming_service",
+            f"/{self.self_id}/mavros/cmd/arming",
+        )
+
+        self.set_mode_srv = rospy.ServiceProxy(
+            self.set_mode_service,
+            SetMode,
+        )
+
+        self.arming_srv = rospy.ServiceProxy(
+            self.arming_service,
+            CommandBool,
         )
 
         # ========================================================
@@ -390,6 +589,8 @@ class TaskFSMNode:
         self.gps_lat = float("nan")
         self.gps_lon = float("nan")
         self.gps_alt = float("nan")
+        self.last_extended_state_time = 0.0
+        self.landed_state = int(getattr(ExtendedState, "LANDED_STATE_UNDEFINED", 0))
 
         self.last_ekf_time = 0.0
         self.ekf_flags = {
@@ -405,6 +606,13 @@ class TaskFSMNode:
         self.last_rc_time = 0.0
         self.rc_channels = []
         self.rc_rssi = 0
+        self.last_manual_control_time = 0.0
+        self.manual_control_buttons = 0
+        self.manual_control_x = 0.0
+        self.manual_control_y = 0.0
+        self.manual_control_z = 0.0
+        self.manual_control_r = 0.0
+        self.task_switch_hook_active_last = False
 
         self.self_check_report: Dict[str, Any] = {}
 
@@ -429,13 +637,14 @@ class TaskFSMNode:
             self.task_state = self.TASK_SELF_CHECK
 
         self.prev_task_state = ""
+        self.state_enter_time = now_sec()
 
         # 当前同步动作信息
         self.current_action = ""
         self.current_payload: Dict[str, Any] = {}
         self.current_sync_id = ""
         self.current_t0 = 0.0
-        self.action_start_wall_time = 0.0
+        self.action_start_time = 0.0
 
         # 已经启动过的同步会话 ID。
         #
@@ -462,6 +671,10 @@ class TaskFSMNode:
 
         # 降落开始时间
         self.land_start_time = 0.0
+        self.master_pilot_hold_mode_reached = False
+        self.emergency_hold_mode_reached = False
+        self.trajectory_reset_success_in_self_check = False
+        self.last_trajectory_reset_req_time = 0.0
 
         # 状态发布限频
         self.last_status_pub_time = 0.0
@@ -560,6 +773,12 @@ class TaskFSMNode:
             queue_size=5,
         )
 
+        self.operator_enter_follow_srv = rospy.Service(
+            self.operator_enter_follow_service,
+            Trigger,
+            self._operator_enter_follow_srv,
+        )
+
         rospy.Subscriber(
             self.operator_hook_sequence_topic,
             Bool,
@@ -581,12 +800,496 @@ class TaskFSMNode:
             queue_size=5,
         )
 
+        rospy.Subscriber(
+            self.mavros_state_topic,
+            State,
+            self._mavros_state_cb,
+            queue_size=20,
+        )
+
+        rospy.Subscriber(
+            self.gps_topic,
+            NavSatFix,
+            self._gps_cb,
+            queue_size=20,
+        )
+
+        rospy.Subscriber(
+            self.extended_state_topic,
+            ExtendedState,
+            self._extended_state_cb,
+            queue_size=20,
+        )
+
+        if EstimatorStatus is not None:
+            rospy.Subscriber(
+                self.estimator_status_topic,
+                EstimatorStatus,
+                self._estimator_status_cb,
+                queue_size=20,
+            )
+        elif self.require_ekf:
+            rospy.logwarn(
+                "[%s TaskFSM] mavros_msgs/EstimatorStatus not available; "
+                "EKF self-check will not pass unless ~require_ekf is false",
+                self.self_id,
+            )
+
+        rospy.Subscriber(
+            self.rc_in_topic,
+            RCIn,
+            self._rc_in_cb,
+            queue_size=20,
+        )
+
+        rospy.Subscriber(
+            self.manual_control_topic,
+            ManualControl,
+            self._manual_control_cb,
+            queue_size=20,
+        )
+
         rospy.loginfo(
-            "[TaskFSMNode] role=%s self_id=%s init_state=%s",
+            "[TaskFSMNode] role=%s self_id=%s init_state=%s offboard_permission_source=%s",
             self.role,
             self.self_id,
             self.task_state,
+            self.offboard_permission_source,
         )
+
+    @staticmethod
+    def _parse_csv_param(value: Any) -> list:
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        return [item.strip() for item in str(value).split(",") if item.strip()]
+
+    # ============================================================
+    # 自检输入回调
+    # ============================================================
+
+    def _mavros_state_cb(self, msg: State):
+        """
+        /mavros/state：
+            - connected 用于 MAVROS 连接检查；
+            - mode/armed 进入自检报告，方便排查。
+        """
+        self.last_mavros_state_time = now_sec()
+        self.mavros_connected = bool(msg.connected)
+        self.mavros_mode = msg.mode
+        self.mavros_armed = bool(msg.armed)
+
+    def _gps_cb(self, msg: NavSatFix):
+        """
+        /mavros/global_position/global：
+            - status.status 用于 GPS fix 检查；
+            - latitude/longitude/altitude 用于有效数值检查。
+        """
+        self.last_gps_time = now_sec()
+        self.gps_fix_status = int(msg.status.status)
+        self.gps_lat = float(msg.latitude)
+        self.gps_lon = float(msg.longitude)
+        self.gps_alt = float(msg.altitude)
+
+    def _extended_state_cb(self, msg: ExtendedState):
+        self.last_extended_state_time = now_sec()
+        self.landed_state = int(msg.landed_state)
+
+    def _estimator_status_cb(self, msg):
+        """
+        /mavros/estimator_status：
+            将 MAVROS EKF2 estimator flags 缓存成自检使用的布尔量。
+        """
+        self.last_ekf_time = now_sec()
+        self.ekf_flags["attitude"] = bool(msg.attitude_status_flag)
+        self.ekf_flags["vel_horiz"] = bool(msg.velocity_horiz_status_flag)
+        self.ekf_flags["vel_vert"] = bool(msg.velocity_vert_status_flag)
+        self.ekf_flags["pos_horiz_abs"] = bool(msg.pos_horiz_abs_status_flag)
+        self.ekf_flags["pos_vert_abs"] = bool(msg.pos_vert_abs_status_flag)
+        self.ekf_flags["gps_glitch"] = bool(msg.gps_glitch_status_flag)
+        self.ekf_flags["accel_error"] = bool(msg.accel_error_status_flag)
+
+    def _rc_in_cb(self, msg: RCIn):
+        """
+        /mavros/rc/in：
+            - channels 用于通道数检查；
+            - rssi 在 rc_min_rssi >= 0 时参与检查。
+        """
+        now = now_sec()
+        self.last_rc_time = now
+        self.rc_channels = list(msg.channels)
+        self.rc_rssi = int(msg.rssi)
+        self._update_rc_offboard_permission(now)
+
+    def _manual_control_cb(self, msg: ManualControl):
+        """
+        /mavros/manual_control/control：
+            QGC joystick / 虚拟摇杆通常通过 MAVLink MANUAL_CONTROL 到飞控，
+            MAVROS 在这里给出归一化杆量和 buttons 位图。
+        """
+        now = now_sec()
+        self.last_manual_control_time = now
+        self.manual_control_x = float(msg.x)
+        self.manual_control_y = float(msg.y)
+        self.manual_control_z = float(msg.z)
+        self.manual_control_r = float(msg.r)
+        self.manual_control_buttons = int(msg.buttons)
+        self._update_rc_offboard_permission(now)
+
+    def _update_rc_offboard_permission(self, t: Optional[float] = None):
+        """
+        根据配置的许可来源刷新 OFFBOARD/ARM 许可。
+        """
+        if t is None:
+            t = now_sec()
+
+        if self._is_always_permission_strategy():
+            self._set_offboard_permission(True, "always")
+            return
+
+        if self._is_manual_control_strategy():
+            self._update_manual_control_offboard_permission(t)
+            return
+
+        if self._is_rc_in_strategy():
+            self._update_rc_in_offboard_permission(t)
+            return
+
+        rospy.logwarn_throttle(
+            2.0,
+            "[%s TaskFSM] unknown offboard_permission_source=%s; program control disabled",
+            self.self_id,
+            self.offboard_permission_source,
+        )
+        self._set_offboard_permission(False, "unknown_source")
+
+    def _update_rc_in_offboard_permission(self, t: float):
+        """
+        根据 RCIn 中的三段拨杆通道刷新 OFFBOARD/ARM 许可。
+
+        offboard_switch_channel 是遥控器通道号，从 1 开始；
+        RCIn.channels 是 Python 数组，从 0 开始。
+        """
+        new_permission = False
+
+        channel_index = self.offboard_switch_channel - 1
+
+        if self.offboard_switch_channel <= 0:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] invalid offboard_switch_channel=%s; program control disabled",
+                self.self_id,
+                self.offboard_switch_channel,
+            )
+        elif self.last_rc_time <= 0.0 or (t - self.last_rc_time) > self.rc_timeout:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] RCIn timeout; program OFFBOARD/ARM permission disabled",
+                self.self_id,
+            )
+        elif len(self.rc_channels) <= channel_index:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] RCIn has %d channels, need channel %d for OFFBOARD permission",
+                self.self_id,
+                len(self.rc_channels),
+                self.offboard_switch_channel,
+            )
+        else:
+            switch_value = int(self.rc_channels[channel_index])
+            new_permission = switch_value >= self.offboard_switch_high_threshold
+
+        self._set_offboard_permission(new_permission, "rc_in")
+
+    def _update_manual_control_offboard_permission(self, t: float):
+        """
+        根据 ManualControl.buttons 中的 SB 开关位刷新 OFFBOARD/ARM 许可。
+
+        SB 默认由 bit7/bit6 编码：
+            10: 不允许
+            01: 不允许
+            00: 允许 OFFBOARD/ARM
+        """
+        if self.last_manual_control_time <= 0.0 or (
+            t - self.last_manual_control_time
+        ) > self.manual_control_timeout:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] ManualControl timeout; program OFFBOARD/ARM permission disabled",
+                self.self_id,
+            )
+            self._set_offboard_permission(False, "manual_control_timeout")
+            return
+
+        if self.manual_control_sb_high_bit < 0 or self.manual_control_sb_low_bit < 0:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] invalid manual_control SB bits high=%s low=%s; program control disabled",
+                self.self_id,
+                self.manual_control_sb_high_bit,
+                self.manual_control_sb_low_bit,
+            )
+            self._set_offboard_permission(False, "invalid_manual_control_bits")
+            return
+
+        high = (self.manual_control_buttons >> self.manual_control_sb_high_bit) & 0x01
+        low = (self.manual_control_buttons >> self.manual_control_sb_low_bit) & 0x01
+        new_permission = (high == 0) and (low == 0)
+
+        self._set_offboard_permission(new_permission, f"manual_control_sb={high}{low}")
+
+    def _is_always_permission_strategy(self) -> bool:
+        return self.offboard_permission_source in ["always", "true", "demo"]
+
+    def _is_manual_control_strategy(self) -> bool:
+        return self.offboard_permission_source in [
+            "manual",
+            "manual_control",
+            "qgc_joystick",
+        ]
+
+    def _is_rc_in_strategy(self) -> bool:
+        return self.offboard_permission_source in ["rc", "rc_in"]
+
+    def _manual_control_fresh(self, t: Optional[float] = None) -> bool:
+        if t is None:
+            t = now_sec()
+        return (
+            self.last_manual_control_time > 0.0
+            and (t - self.last_manual_control_time) <= self.manual_control_timeout
+        )
+
+    def _manual_control_bit(self, bit_index: int) -> int:
+        rospy.logdebug_throttle(
+            5.0,
+            "[%s TaskFSM] manual_control_buttons=0b%s, checking bit_index=%d",
+            self.self_id,
+            format(self.manual_control_buttons, '08b'),
+            bit_index,
+        )
+        if bit_index < 0:
+            return 0
+        
+
+        return (self.manual_control_buttons >> bit_index) & 0x01
+
+    def _task_switch_takeoff_advance_allowed(self) -> bool:
+        """
+        起飞运行阶段是否允许进入下一任务阶段。
+
+        manual_control 策略：
+            SA=1 才允许 TASK_TAKEOFF_RUNNING -> TASK_WAIT_ENTER_FOLLOW_CMD。
+
+        rc_in 策略：
+            先留占位，当前保持原流程，不额外卡住任务。
+        """
+        if self._is_manual_control_strategy():
+            if not self._manual_control_fresh():
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s TaskFSM] wait SA switch, but ManualControl is not fresh",
+                    self.self_id,
+                )
+                return False
+
+            sa = self._manual_control_bit(self.manual_control_sa_bit)
+            allowed = sa == self.manual_control_sa_active_value
+            if not allowed:
+                rospy.loginfo_throttle(
+                    2.0,
+                    "[%s TaskFSM] takeoff reached; waiting SA=%s, current SA=%s",
+                    self.self_id,
+                    self.manual_control_sa_active_value,
+                    sa,
+                )
+            return allowed
+
+        if self._is_rc_in_strategy():
+            return self._rc_task_switch_takeoff_advance_allowed()
+        # TODO 实现RC策略
+
+        return True
+
+    def _task_switch_land_requested(self) -> bool:
+        """
+        是否由任务开关请求降落。
+
+        manual_control 策略：
+            SD=1 请求结束任务并进入 land 同步。
+
+        rc_in 策略：
+            先留占位，当前不触发降落。
+        """
+        if self._is_manual_control_strategy():
+            if not self._manual_control_fresh():
+                return False
+            return self._manual_control_bit(self.manual_control_sd_bit) == self.manual_control_sd_land_value
+
+        if self._is_rc_in_strategy():
+            return self._rc_task_switch_land_requested()
+
+        return False
+
+    def _task_switch_hook_requested(self) -> bool:
+        """
+        hook 释放任务开关，上升沿触发，避免按钮保持时重复进入 hook。
+        """
+        active = False
+        if self._is_manual_control_strategy():
+            active = (
+                self._manual_control_fresh()
+                and self._manual_control_bit(self.manual_control_hook_bit)
+                == self.manual_control_hook_value
+            )
+        if self._is_rc_in_strategy():
+            active = self._rc_task_switch_hook_requested()
+
+        requested = active and not self.task_switch_hook_active_last
+        self.task_switch_hook_active_last = active
+        return requested
+
+    def _rc_task_switch_takeoff_advance_allowed(self) -> bool:
+        # TODO: 后续有 RC 通道后，在这里实现 TAKEOFF_RUNNING 阶段推进开关。
+        return True
+
+    def _rc_task_switch_land_requested(self) -> bool:
+        return self._rc_channel_matches(
+            self.rc_task_land_channel,
+            self.rc_task_land_threshold,
+            self.rc_task_land_direction,
+        )
+
+    def _rc_task_switch_hook_requested(self) -> bool:
+        return self._rc_channel_matches(
+            self.rc_task_hook_channel,
+            self.rc_task_hook_threshold,
+            self.rc_task_hook_direction,
+        )
+
+    def _rc_channel_matches(self, channel: int, threshold: int, direction: str) -> bool:
+        if channel <= 0:
+            return False
+
+        t = now_sec()
+        if self.last_rc_time <= 0.0 or (t - self.last_rc_time) > self.rc_timeout:
+            return False
+
+        channel_index = channel - 1
+        if len(self.rc_channels) <= channel_index:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] RCIn has %d channels, need channel %d for task switch",
+                self.self_id,
+                len(self.rc_channels),
+                channel,
+            )
+            return False
+
+        value = int(self.rc_channels[channel_index])
+        if direction in ["above", "high", "greater", ">=", "gt"]:
+            return value >= threshold
+        if direction in ["below", "low", "less", "<=", "lt"]:
+            return value <= threshold
+
+        rospy.logwarn_throttle(
+            2.0,
+            "[%s TaskFSM] invalid RC task switch direction=%s for channel %d",
+            self.self_id,
+            direction,
+            channel,
+        )
+        return False
+
+    def _handle_follow_stage_actions(self, return_state: str) -> bool:
+        """
+        主从/飞手接管阶段的任务入口。
+
+        这些动作放在这里，是因为 hook 和 land 只有在起飞完成、进入
+        MASTER_PILOT_HOLD / FOLLOW_MASTER 后才有任务意义。状态函数只负责
+        维持当前飞行控制形态，然后把阶段内任务入口委托给本函数。
+        """
+        if (
+            self.role == "master"
+            and return_state == self.TASK_MASTER_PILOT_HOLD
+            and (self.cmd_land or self._task_switch_land_requested())
+        ):
+            self._master_request_sync_if_needed(
+                action="land",
+                payload={
+                    "mode": "PX4_LAND_OR_CONTROLLER_LAND",
+                    "requested_by": "operator",
+                },
+            )
+            return True
+
+        if self.cmd_hook_sequence or self._task_switch_hook_requested():
+            self._begin_hook_sequence(return_state=return_state)
+            return True
+
+        return False
+
+    def _set_offboard_permission(self, new_permission: bool, reason: str = ""):
+        old_permission = self.rc_offboard_permission
+        if old_permission == new_permission:
+            return
+
+        self.rc_offboard_permission = new_permission
+        self._handle_offboard_permission_changed(
+            old_permission,
+            new_permission,
+            reason,
+        )
+
+    def _handle_offboard_permission_changed(
+        self,
+        old_permission: bool,
+        new_permission: bool,
+        reason: str = "",
+    ):
+        """
+        三段拨杆许可状态变化处理。
+
+        old=True, new=False:
+            飞手从程序干预档拨回低/中档；
+            程序停止抢 OFFBOARD；
+            如果当前在 OFFBOARD，则主动切 POSCTL；
+            同时通知控制器进入人工接管 / passive。
+
+        old=False, new=True:
+            飞手拨到高位；
+            这里只表示允许程序干预；
+            不代表立刻切 OFFBOARD。
+        """
+        rospy.logwarn(
+            "[%s TaskFSM] offboard permission changed: %s -> %s source=%s reason=%s",
+            self.self_id,
+            old_permission,
+            new_permission,
+            self.offboard_permission_source,
+            reason,
+        )
+
+        if old_permission and not new_permission:
+            rospy.logwarn(
+                "[%s TaskFSM] RC switch leaves program-control position, request POSCTL",
+                self.self_id,
+            )
+
+            self._request_position_mode()
+
+            # self.publish_controller_command(
+            #     mode="PILOT_TAKEOVER",
+            #     payload={
+            #         "reason": "offboard_permission_revoked",
+            #         "target_px4_mode": "POSCTL",
+            #     },
+            # )
+
+        elif (not old_permission) and new_permission:
+            rospy.logwarn(
+                "[%s TaskFSM] switch allows program OFFBOARD control",
+                self.self_id,
+            )
 
     # ============================================================
     # 人工指令回调
@@ -628,6 +1331,11 @@ class TaskFSMNode:
         """
         if msg.data:
             self.cmd_enter_follow = True
+
+    def _operator_enter_follow_srv(self, _req):
+        self.cmd_enter_follow = True
+        rospy.loginfo("[%s TaskFSM] enter_follow service accepted", self.self_id)
+        return TriggerResponse(success=True, message="enter_follow accepted")
 
     def _operator_hook_sequence_cb(self, msg: Bool):
         """
@@ -757,6 +1465,9 @@ class TaskFSMNode:
             # 紧急保持优先级最高。
             self._check_emergency_first()
 
+            # 根据配置来源刷新 OFFBOARD / ARM 许可。
+            self._update_rc_offboard_permission()
+
             # 向 sync_gate_node 发布同步状态。
             self._publish_sync_status_periodically()
 
@@ -765,6 +1476,9 @@ class TaskFSMNode:
 
             # 收到 SCHEDULED 后，任务层自己按 t0 启动。
             self._start_scheduled_action_if_due()
+
+            # 低频管理 OFFBOARD / ARM
+            self._manage_offboard_and_arm_low_rate()
 
             # 当前状态处理。
             self._tick_task_50hz()
@@ -790,6 +1504,418 @@ class TaskFSMNode:
             self.scheduled_event = None
             self._set_state(self.TASK_EMERGENCY_HOLD)
 
+
+
+    def _state_requires_offboard(self) -> bool:
+        """
+        判断当前任务状态是否需要 PX4 处于 OFFBOARD。
+
+        注意：
+            这里只判断任务状态是否需要 OFFBOARD；
+            最终是否真的请求 OFFBOARD，还要看 rc_offboard_permission。
+        """
+        if not self.enable_offboard_manager:
+            return False
+
+        if self.task_state in [
+            self.TASK_TAKEOFF_RUNNING,
+            self.TASK_WAIT_ENTER_FOLLOW_CMD,
+            self.TASK_FOLLOW_MASTER,
+            self.TASK_HOOK_SEQUENCE_RUNNING,
+            self.TASK_LAND_RUNNING,
+        ]:
+            return True
+
+        # TAKEOFF_READY 下，如果 master 收到起飞指令，可以提前准备 OFFBOARD
+        if (
+            self.task_state == self.TASK_TAKEOFF_READY
+            and self.offboard_in_takeoff_ready_after_cmd
+            and self.cmd_takeoff
+        ):
+            return True
+
+        # 收到 takeoff 的 SCHEDULED 后，在 t0 前 prearm_before_t0 秒内提前准备
+        if self.scheduled_event is not None:
+            action = self.scheduled_event.get("action", "")
+            if action == "takeoff":
+                try:
+                    t0 = float(self.scheduled_event.get("t0", 0.0))
+                except Exception:
+                    t0 = 0.0
+
+                if t0 > 0.0 and now_sec() >= t0 - self.prearm_before_t0:
+                    return True
+
+        return False
+
+    def _state_requires_arm(self) -> bool:
+        """
+        判断当前任务状态是否需要自动解锁。
+
+        注意：
+            最终是否真的 arm，还要看：
+                1. auto_arm；
+                2. rc_offboard_permission；
+                3. mavros_connected；
+                4. 当前是否已经 armed。
+        """
+        if not self.enable_offboard_manager:
+            return False
+
+        if not self.auto_arm:
+            return False
+
+        if self.task_state in [
+            self.TASK_TAKEOFF_RUNNING,
+            self.TASK_WAIT_ENTER_FOLLOW_CMD,
+            self.TASK_FOLLOW_MASTER,
+            self.TASK_HOOK_SEQUENCE_RUNNING,
+            self.TASK_LAND_RUNNING,
+        ]:
+            return True
+
+        # 收到 takeoff 的 SCHEDULED 后，在 t0 前 prearm_before_t0 秒内提前解锁
+        if self.scheduled_event is not None:
+            action = self.scheduled_event.get("action", "")
+            if action == "takeoff":
+                try:
+                    t0 = float(self.scheduled_event.get("t0", 0.0))
+                except Exception:
+                    t0 = 0.0
+
+                if t0 > 0.0 and now_sec() >= t0 - self.prearm_before_t0:
+                    return True
+
+        return False
+
+    def _manage_offboard_and_arm_low_rate(self):
+        """
+        低频管理 PX4 OFFBOARD 和 ARM。
+
+        原则：
+            1. FSM 不发布具体控制量；
+            2. 控制量由外部控制节点持续发布；
+            3. FSM 只负责根据任务状态和三段拨杆许可，低频请求 OFFBOARD / ARM；
+            4. 拨杆不在高位时，绝不请求 OFFBOARD / ARM。
+        """
+        if not self.enable_offboard_manager:
+            return
+
+        t = now_sec()
+        period = 1.0 / max(self.offboard_manage_rate, 1e-6)
+
+        if t - self.last_offboard_manage_time < period:
+            return
+
+        self.last_offboard_manage_time = t
+
+        need_offboard = self._state_requires_offboard()
+        need_arm = self._state_requires_arm()
+
+        if not need_offboard and not need_arm:
+            return
+
+        if not self._offboard_arm_request_delay_passed(t):
+            return
+
+        if not self.mavros_connected:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] state=%s needs OFFBOARD/ARM, but MAVROS not connected",
+                self.self_id,
+                self.task_state,
+            )
+            return
+
+        # 关键保护：开关许可不满足时，程序绝不请求 OFFBOARD / ARM。
+        if not self.rc_offboard_permission:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] state=%s needs OFFBOARD/ARM, but switch source=%s does not permit program control",
+                self.self_id,
+                self.task_state,
+                self.offboard_permission_source,
+            )
+            return
+
+        # 先请求 OFFBOARD
+        if need_offboard and self.auto_offboard:
+            if self.mavros_mode != "OFFBOARD":
+                self._request_offboard_mode()
+                return
+
+        # 再请求 ARM
+        if need_arm and self.auto_arm:
+            if not self.mavros_armed:
+                self._request_arm()
+
+    def _offboard_arm_request_delay_passed(self, t: float) -> bool:
+        delay = max(self.offboard_arm_request_delay, 0.0)
+        if delay <= 0.0:
+            return True
+
+        base_time = self.state_enter_time
+        if self.scheduled_event is not None:
+            action = self.scheduled_event.get("action", "")
+            if action == "takeoff":
+                try:
+                    t0 = float(self.scheduled_event.get("t0", 0.0))
+                except Exception:
+                    t0 = 0.0
+                if t0 > 0.0:
+                    base_time = t0 - self.prearm_before_t0
+
+        if t < base_time + delay:
+            rospy.loginfo_throttle(
+                2.0,
+                "[%s TaskFSM] stagger OFFBOARD/ARM request delay %.2fs",
+                self.self_id,
+                base_time + delay - t,
+            )
+            return False
+
+        return True
+
+    def _request_offboard_mode(self):
+        """
+        请求 PX4 进入 OFFBOARD。
+
+        注意：
+            PX4 进入 OFFBOARD 前，外部控制节点必须已经持续发布 setpoint。
+            这个函数不负责 setpoint。
+        """
+        t = now_sec()
+
+        if t - self.last_set_mode_req_time < self.set_mode_min_interval:
+            return
+
+        self.last_set_mode_req_time = t
+
+        try:
+            resp = self.set_mode_srv(custom_mode="OFFBOARD")
+
+            rospy.logwarn(
+                "[%s TaskFSM] request OFFBOARD, mode_sent=%s current_mode=%s",
+                self.self_id,
+                getattr(resp, "mode_sent", False),
+                self.mavros_mode,
+            )
+
+        except rospy.ServiceException as e:
+            rospy.logwarn(
+                "[%s TaskFSM] set_mode OFFBOARD failed: %s",
+                self.self_id,
+                str(e),
+            )
+
+    def _request_position_mode(self):
+        """
+        当前处于 OFFBOARD 时，请求 PX4 切回 POSCTL。
+        """
+        if self.mavros_mode != "OFFBOARD":
+            return
+
+        if not self.mavros_connected:
+            rospy.logwarn(
+                "[%s TaskFSM] cannot request POSCTL, MAVROS not connected",
+                self.self_id,
+            )
+            return
+
+        try:
+            resp = self.set_mode_srv(custom_mode="POSCTL")
+
+            rospy.logwarn(
+                "[%s TaskFSM] request POSCTL, mode_sent=%s current_mode=%s",
+                self.self_id,
+                getattr(resp, "mode_sent", False),
+                self.mavros_mode,
+            )
+
+        except rospy.ServiceException as e:
+            rospy.logwarn(
+                "[%s TaskFSM] set_mode POSCTL failed: %s",
+                self.self_id,
+                str(e),
+            )
+
+    def _ensure_master_pilot_hold_mode(self):
+        if self.master_pilot_hold_mode_reached:
+            return
+
+        if not self.enable_master_pilot_hold_mode:
+            self.master_pilot_hold_mode_reached = True
+            return
+
+        if not self.master_pilot_hold_px4_mode:
+            self.master_pilot_hold_mode_reached = True
+            return
+
+        if self.mavros_mode == self.master_pilot_hold_px4_mode:
+            self.master_pilot_hold_mode_reached = True
+            rospy.logwarn(
+                "[%s TaskFSM] master pilot hold mode reached: %s",
+                self.self_id,
+                self.master_pilot_hold_px4_mode,
+            )
+            return
+
+        if not self.mavros_connected:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] waiting MAVROS connection before requesting master pilot hold mode=%s",
+                self.self_id,
+                self.master_pilot_hold_px4_mode,
+            )
+            return
+
+        t = now_sec()
+        if t - self.last_set_mode_req_time < self.set_mode_min_interval:
+            return
+
+        self.last_set_mode_req_time = t
+
+        try:
+            resp = self.set_mode_srv(custom_mode=self.master_pilot_hold_px4_mode)
+            rospy.logwarn(
+                "[%s TaskFSM] request master pilot hold mode=%s, mode_sent=%s current_mode=%s",
+                self.self_id,
+                self.master_pilot_hold_px4_mode,
+                getattr(resp, "mode_sent", False),
+                self.mavros_mode,
+            )
+        except rospy.ServiceException as e:
+            rospy.logwarn(
+                "[%s TaskFSM] set_mode %s failed: %s",
+                self.self_id,
+                self.master_pilot_hold_px4_mode,
+                str(e),
+            )
+
+    def _ensure_emergency_hold_mode(self):
+        if self.emergency_hold_mode_reached:
+            return
+
+        if not self.enable_emergency_hold_mode:
+            self.emergency_hold_mode_reached = True
+            return
+
+        if not self.emergency_hold_px4_mode:
+            self.emergency_hold_mode_reached = True
+            return
+
+        if self.mavros_mode == self.emergency_hold_px4_mode:
+            self.emergency_hold_mode_reached = True
+            rospy.logwarn(
+                "[%s TaskFSM] emergency hold mode reached: %s",
+                self.self_id,
+                self.emergency_hold_px4_mode,
+            )
+            return
+
+        if not self.mavros_connected:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] waiting MAVROS connection before requesting emergency hold mode=%s",
+                self.self_id,
+                self.emergency_hold_px4_mode,
+            )
+            return
+
+        t = now_sec()
+        if t - self.last_set_mode_req_time < self.set_mode_min_interval:
+            return
+
+        self.last_set_mode_req_time = t
+
+        try:
+            resp = self.set_mode_srv(custom_mode=self.emergency_hold_px4_mode)
+            rospy.logwarn(
+                "[%s TaskFSM] request emergency hold mode=%s, mode_sent=%s current_mode=%s",
+                self.self_id,
+                self.emergency_hold_px4_mode,
+                getattr(resp, "mode_sent", False),
+                self.mavros_mode,
+            )
+        except rospy.ServiceException as e:
+            rospy.logwarn(
+                "[%s TaskFSM] set_mode %s failed: %s",
+                self.self_id,
+                self.emergency_hold_px4_mode,
+                str(e),
+            )
+
+    def _ensure_px4_land_mode(self):
+        if not self.enable_px4_land_mode:
+            return
+
+        if not self.land_px4_mode:
+            return
+
+        if self.mavros_mode == self.land_px4_mode:
+            return
+
+        if not self.mavros_connected:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] waiting MAVROS connection before requesting PX4 land mode=%s",
+                self.self_id,
+                self.land_px4_mode,
+            )
+            return
+
+        t = now_sec()
+        if t - self.last_set_mode_req_time < self.set_mode_min_interval:
+            return
+
+        self.last_set_mode_req_time = t
+
+        try:
+            resp = self.set_mode_srv(custom_mode=self.land_px4_mode)
+            rospy.logwarn(
+                "[%s TaskFSM] request PX4 land mode=%s, mode_sent=%s current_mode=%s",
+                self.self_id,
+                self.land_px4_mode,
+                getattr(resp, "mode_sent", False),
+                self.mavros_mode,
+            )
+        except rospy.ServiceException as e:
+            rospy.logwarn(
+                "[%s TaskFSM] set_mode %s failed: %s",
+                self.self_id,
+                self.land_px4_mode,
+                str(e),
+            )
+
+    def _request_arm(self):
+        """
+        请求 PX4 解锁。
+        """
+        t = now_sec()
+
+        if t - self.last_arm_req_time < self.arm_min_interval:
+            return
+
+        self.last_arm_req_time = t
+
+        try:
+            resp = self.arming_srv(True)
+
+            rospy.logwarn(
+                "[%s TaskFSM] request ARM, success=%s armed=%s",
+                self.self_id,
+                getattr(resp, "success", False),
+                self.mavros_armed,
+            )
+
+        except rospy.ServiceException as e:
+            rospy.logwarn(
+                "[%s TaskFSM] arm failed: %s",
+                self.self_id,
+                str(e),
+            )
+
+
     # ============================================================
     # 状态处理函数
     # ============================================================
@@ -800,7 +1926,8 @@ class TaskFSMNode:
             master 等待外部 start。
             slave 一般不会停在这里。
         """
-        self.publish_controller_hold(capture_current=False)
+        # self.publish_controller_hold(capture_current=False)
+        pass
 
     def _state_self_check(self):
         """
@@ -815,10 +1942,60 @@ class TaskFSMNode:
             - 电池/燃电状态
             - 传感器状态
         """
-        self.publish_controller_hold(capture_current=False)
+        # self.publish_controller_hold(capture_current=False)
+        self._call_trajectory_reset_service_if_needed()
 
         if self.check_self_check_passed():
             self._set_state(self.TASK_TAKEOFF_READY)
+
+    def _call_trajectory_reset_service_if_needed(self):
+        if self.trajectory_reset_success_in_self_check:
+            return
+
+        if not self.trajectory_reset_service:
+            return
+
+        t = now_sec()
+        if (
+            self.last_trajectory_reset_req_time > 0.0
+            and t - self.last_trajectory_reset_req_time
+            < self.trajectory_reset_retry_interval
+        ):
+            return
+
+        self.last_trajectory_reset_req_time = t
+
+        try:
+            rospy.wait_for_service(
+                self.trajectory_reset_service,
+                timeout=self.trajectory_reset_service_timeout,
+            )
+            resp = rospy.ServiceProxy(self.trajectory_reset_service, Trigger)()
+        except Exception as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] trajectory reset service call failed service=%s error=%s",
+                self.self_id,
+                self.trajectory_reset_service,
+                exc,
+            )
+            return
+
+        if bool(getattr(resp, "success", False)):
+            self.trajectory_reset_success_in_self_check = True
+            rospy.loginfo(
+                "[%s TaskFSM] trajectory reset service succeeded: %s",
+                self.self_id,
+                getattr(resp, "message", ""),
+            )
+            return
+
+        rospy.logwarn_throttle(
+            2.0,
+            "[%s TaskFSM] trajectory reset service returned false: %s",
+            self.self_id,
+            getattr(resp, "message", ""),
+        )
 
     def _state_takeoff_ready(self):
         """
@@ -835,7 +2012,7 @@ class TaskFSMNode:
         slave：
             不主动 request，只向 sync_gate_node 报告 ready_for_takeoff。
         """
-        self.publish_controller_hold(capture_current=False)
+        # self.publish_controller_hold(capture_current=False)
 
         if self.role == "master" and self.cmd_takeoff:
             self._master_request_sync_if_needed(
@@ -864,14 +2041,22 @@ class TaskFSMNode:
         """
         tau = now_sec() - self.current_t0
 
-        self.publish_controller_track_trajectory(
-            trajectory_id=self.current_sync_id,
-            action="takeoff",
-        )
+        # self.publish_controller_track_trajectory(
+        #     trajectory_id=self.current_sync_id,
+        #     action="takeoff",
+        # )
 
-        if self.check_takeoff_reached(tau):
+        if self.check_takeoff_reached(tau) and self._task_switch_takeoff_advance_allowed():
             self._finish_action()
             self._set_state(self.TASK_WAIT_ENTER_FOLLOW_CMD)
+        else:
+            rospy.loginfo_throttle(
+                5.0,
+                "[%s TaskFSM] taking off... tau=%.1f reached=%s",
+                self.self_id,
+                tau,
+                self.check_takeoff_reached(tau),
+            )
 
     def _state_wait_enter_follow_cmd(self):
         """
@@ -889,7 +2074,7 @@ class TaskFSMNode:
         slave：
             进入 FOLLOW_MASTER。
         """
-        self.publish_controller_hold(capture_current=False)
+        # self.publish_controller_hold(capture_current=False)
 
         if self.cmd_enter_follow:
             if self.role == "master":
@@ -902,26 +2087,13 @@ class TaskFSMNode:
         TASK_MASTER_PILOT_HOLD：
             master 等待或接受飞手接管。
 
-        默认不切 PX4 HOLD，而是发布软件 HOLD 给控制器。
-        如果飞手已经通过遥控器接入，你可以让控制器进入 PILOT_PASS_THROUGH。
-        这里留接口，不强行实现。
+        先保证 PX4 进入 HOLD；一旦确认进入过 HOLD，后续不再强切，
+        让飞手可以通过遥控器覆盖接管。
         """
-        self.publish_controller_master_pilot_hold()
+        self._ensure_master_pilot_hold_mode()
 
-        # 松钩/收绳不需要同步。
-        if self.cmd_hook_sequence:
-            self._begin_hook_sequence(return_state=self.TASK_MASTER_PILOT_HOLD)
+        if self._handle_follow_stage_actions(return_state=self.TASK_MASTER_PILOT_HOLD):
             return
-
-        # 同步降落需要同步器。
-        if self.cmd_land:
-            self._master_request_sync_if_needed(
-                action="land",
-                payload={
-                    "mode": "PX4_LAND_OR_CONTROLLER_LAND",
-                    "requested_by": "operator",
-                },
-            )
 
     def _state_follow_master(self):
         """
@@ -931,11 +2103,9 @@ class TaskFSMNode:
         不走同步器。
         你的从机跟随控制器在这里工作。
         """
-        self.publish_controller_follow_master()
+        # self.publish_controller_follow_master()
 
-        # 松钩/收绳不需要同步。
-        if self.cmd_hook_sequence:
-            self._begin_hook_sequence(return_state=self.TASK_FOLLOW_MASTER)
+        if self._handle_follow_stage_actions(return_state=self.TASK_FOLLOW_MASTER):
             return
 
         # slave 不主动 request land。
@@ -954,13 +2124,28 @@ class TaskFSMNode:
 
         所以这里除了控制钩子/绳子，不改变飞控控制权。
         """
+        if self.role == "master" and (
+            self.cmd_land or self._task_switch_land_requested()
+        ):
+            self._master_request_sync_if_needed(
+                action="land",
+                payload={
+                    "mode": "PX4_LAND_OR_CONTROLLER_LAND",
+                    "requested_by": "operator_during_hook",
+                },
+            )
+            return
+
         # 保持原飞行控制模式
         if self.return_state_after_hook == self.TASK_MASTER_PILOT_HOLD:
-            self.publish_controller_master_pilot_hold()
+            # self.publish_controller_master_pilot_hold()
+            pass
         elif self.return_state_after_hook == self.TASK_FOLLOW_MASTER:
-            self.publish_controller_follow_master()
+            # self.publish_controller_follow_master()
+            pass
         else:
-            self.publish_controller_hold(capture_current=False)
+            # self.publish_controller_hold(capture_current=False)
+            pass
 
         elapsed = now_sec() - self.hook_sequence_start_time
 
@@ -985,13 +2170,10 @@ class TaskFSMNode:
         TASK_LAND_RUNNING：
             同步触发后，所有飞机同时进入 LAND。
 
-        这里可以有两种实现：
-            1. 发布指令给外部模式管理器，让它调用 MAVROS set_mode LAND；
-            2. 发布给控制器，由控制器执行受控降落。
-
-        这里留成统一 controller command。
+        这里请求 PX4 LAND 模式，并用 PX4 landed_state 判断是否落地。
         """
-        self.publish_controller_land()
+        self._ensure_px4_land_mode()
+        # self.publish_controller_land()
 
         if self.check_landed():
             self._set_state(self.TASK_RESETTING)
@@ -1011,23 +2193,18 @@ class TaskFSMNode:
     def _state_emergency_hold(self):
         """
         TASK_EMERGENCY_HOLD：
-            紧急软件保持。
-
-        你的偏好是不希望交还给 PX4。
-        所以这里建议：
-            1. 不切 PX4 HOLD；
-            2. 控制器捕获当前位姿作为 hold setpoint；
-            3. 持续通过 MAVROS 发速度/位置保持指令；
-            4. 若后续需要恢复，由人工发 reset 或重新启动流程。
+            紧急保持，持续请求 PX4 HOLD，直到模式真的切过去。
         """
-        self.publish_controller_hold(capture_current=False)
+        # self.publish_controller_hold(capture_current=False)
+        self._ensure_emergency_hold_mode()
 
     def _state_aborted(self):
         """
         TASK_ABORTED：
-            同步失败或任务异常。
+            同步失败或任务异常，持续请求 PX4 HOLD，等待人工干预。
         """
-        self.publish_controller_hold(capture_current=False)
+        # self.publish_controller_hold(capture_current=False)
+        self._ensure_emergency_hold_mode()
 
     def _state_unknown(self):
         rospy.logerr("[%s TaskFSM] unknown task_state=%s", self.self_id, self.task_state)
@@ -1090,6 +2267,7 @@ class TaskFSMNode:
         if self.task_state in [
             self.TASK_MASTER_PILOT_HOLD,
             self.TASK_FOLLOW_MASTER,
+            self.TASK_HOOK_SEQUENCE_RUNNING,
         ]:
             return "land"
 
@@ -1197,15 +2375,10 @@ class TaskFSMNode:
             t0 = float(event.get("t0", 0.0))
 
             data = {
-                "src": self.self_id,
-                "stamp": now_sec(),
                 "action": action,
-                "sync_id": sync_id,
                 "t0": t0,
-                "payload": {
-                    "takeoff_height": float(payload.get("height", self.takeoff_height)),
-                    "takeoff_duration": float(payload.get("duration", self.takeoff_duration)),
-                },
+                "height": float(payload.get("height", self.takeoff_height)),
+                "duration": float(payload.get("duration", self.takeoff_duration)),
             }
 
             self.takeoff_param_pub.publish(
@@ -1310,7 +2483,7 @@ class TaskFSMNode:
 
         self.current_sync_id = event.get("sync_id", "")
         self.current_t0 = float(event.get("t0", now_sec()))
-        self.action_start_wall_time = now_sec()
+        self.action_start_time = now_sec()
 
         self.scheduled_event = None
         self.request_in_flight = False
@@ -1360,10 +2533,10 @@ class TaskFSMNode:
             },
         )
 
-        self.publish_controller_track_trajectory(
-            trajectory_id=self.current_sync_id,
-            action="takeoff",
-        )
+        # self.publish_controller_track_trajectory(
+        #     trajectory_id=self.current_sync_id,
+        #     action="takeoff",
+        # )
 
         self._set_state(self.TASK_TAKEOFF_RUNNING)
 
@@ -1373,7 +2546,8 @@ class TaskFSMNode:
         """
         self.land_start_time = now_sec()
 
-        self.publish_controller_land()
+        self._ensure_px4_land_mode()
+        # self.publish_controller_land()
 
         self._set_state(self.TASK_LAND_RUNNING)
 
@@ -1388,6 +2562,7 @@ class TaskFSMNode:
         old_state = self.task_state
         self.prev_task_state = old_state
         self.task_state = new_state
+        self.state_enter_time = now_sec()
 
         rospy.loginfo(
             "[%s TaskFSM] %s -> %s",
@@ -1402,20 +2577,69 @@ class TaskFSMNode:
         """
         状态进入时的一次性动作。
         """
-        if new_state == self.TASK_MASTER_PILOT_HOLD:
-            # 默认使用软件 hold。
-            # 如果你明确要切 PX4 HOLD，可以在这里调用独立 mode manager。
-            self.publish_controller_master_pilot_hold(capture_current=True)
+        if new_state == self.TASK_WAIT_ENTER_FOLLOW_CMD:
+            if self.role == "master":
+                self._master_call_enter_follow_services()
+
+        elif new_state == self.TASK_SELF_CHECK:
+            self.trajectory_reset_success_in_self_check = False
+            self.last_trajectory_reset_req_time = 0.0
+
+        elif new_state == self.TASK_MASTER_PILOT_HOLD:
+            # 同一轮任务只保证切入一次 PX4 HOLD；hook 后回到本状态不再强切。
+            # self.publish_controller_master_pilot_hold(capture_current=True)
+            pass
 
         elif new_state == self.TASK_FOLLOW_MASTER:
-            self.publish_controller_follow_master()
+            # self.publish_controller_follow_master()
+            pass
 
         elif new_state == self.TASK_EMERGENCY_HOLD:
-            # 紧急软件 HOLD：进入状态时捕获当前位置。
-            self.publish_controller_hold(capture_current=True)
+            self.emergency_hold_mode_reached = False
+            # 紧急 HOLD：进入状态时捕获当前位置。
+            # self.publish_controller_hold(capture_current=True)
+
+        elif new_state == self.TASK_ABORTED:
+            self.emergency_hold_mode_reached = False
 
         elif new_state == self.TASK_LAND_RUNNING:
             self.land_start_time = now_sec()
+
+    def _master_call_enter_follow_services(self):
+        target_ids = [self.self_id]
+        for participant in self.participants:
+            if participant not in target_ids:
+                target_ids.append(participant)
+
+        for target_id in target_ids:
+            service_name = f"/{target_id}/operator/enter_follow"
+            try:
+                rospy.wait_for_service(
+                    service_name,
+                    timeout=self.operator_enter_follow_service_wait_timeout,
+                )
+                resp = rospy.ServiceProxy(service_name, Trigger)()
+                if resp.success:
+                    rospy.loginfo(
+                        "[%s TaskFSM] enter_follow service ack from %s",
+                        self.self_id,
+                        target_id,
+                    )
+                else:
+                    rospy.logwarn(
+                        "[%s TaskFSM] enter_follow service rejected by %s: %s",
+                        self.self_id,
+                        target_id,
+                        resp.message,
+                    )
+            except Exception as exc:
+                rospy.logwarn(
+                    "[%s TaskFSM] enter_follow service call failed target=%s service=%s error=%s",
+                    self.self_id,
+                    target_id,
+                    service_name,
+                    exc,
+                )
 
     def _finish_action(self):
         """
@@ -1427,7 +2651,7 @@ class TaskFSMNode:
         self.current_payload = {}
         self.current_sync_id = ""
         self.current_t0 = 0.0
-        self.action_start_wall_time = 0.0
+        self.action_start_time = 0.0
         self.scheduled_event = None
         self.request_in_flight = False
 
@@ -1453,6 +2677,7 @@ class TaskFSMNode:
         self.return_state_after_hook = ""
 
         self.land_start_time = 0.0
+        self.master_pilot_hold_mode_reached = False
 
     # ============================================================
     # 松钩/收绳流程
@@ -1713,7 +2938,7 @@ class TaskFSMNode:
             return tau >= self.takeoff_duration
 
         # TODO: 替换为真实高度判断
-        return False
+        return tau >= self.takeoff_duration
 
     def check_landed(self) -> bool:
         """
@@ -1721,15 +2946,25 @@ class TaskFSMNode:
 
         推荐真实逻辑：
             - PX4 landed_state
-            - 高度接近地面
-            - 垂向速度接近 0
-            - 电机状态/arming 状态
         """
         if self.demo_mode:
             return now_sec() - self.land_start_time >= self.land_timeout
 
-        # TODO: 替换为真实落地判断
-        return False
+        t = now_sec()
+        if (
+            self.last_extended_state_time <= 0.0
+            or t - self.last_extended_state_time > self.mavros_state_timeout
+        ):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] waiting fresh MAVROS extended_state for landed detection",
+                self.self_id,
+            )
+            return False
+
+        return self.landed_state == int(
+            getattr(ExtendedState, "LANDED_STATE_ON_GROUND", 1)
+        )
 
     # ============================================================
     # 对外发布：轨迹规划器 / 控制器 / 钩子
@@ -1882,7 +3117,19 @@ class TaskFSMNode:
             "hook_released": self.hook_released,
             "rope_retracted": self.rope_retracted,
             "emergency_hold": self.task_state == self.TASK_EMERGENCY_HOLD,
-            "self_check": self.self_check_report,# 新增：自检结果
+            "self_check": self.self_check_report,
+            "rc_offboard_permission": self.rc_offboard_permission,
+            "offboard_permission_source": self.offboard_permission_source,
+            "offboard_switch_channel": self.offboard_switch_channel,
+            "manual_control_buttons": self.manual_control_buttons,
+            "manual_control_sb_bits": "{}{}".format(
+                (self.manual_control_buttons >> self.manual_control_sb_high_bit) & 0x01,
+                (self.manual_control_buttons >> self.manual_control_sb_low_bit) & 0x01,
+            ),
+            "manual_control_sa": self._manual_control_bit(self.manual_control_sa_bit),
+            "manual_control_sd": self._manual_control_bit(self.manual_control_sd_bit),
+            "need_offboard": self._state_requires_offboard(),
+            "need_arm": self._state_requires_arm(),
         }
 
         self.mission_state_pub.publish(

@@ -1,0 +1,39 @@
+<launch>
+    <!--
+        纯 master 单机仿真启动文件。
+        用于只测试 uav0 主机流程，不等待任何 slave ACK。
+    -->
+
+    <arg name="run_id" default="coop_lift_test_001_master_sim"/>
+    <arg name="self_id" default="uav0"/>
+    <arg name="auto_start" default="false"/>
+    <arg name="control_rate_hz" default="50.0"/>
+    <arg name="demo_mode" default="false"/>
+    <arg name="max_send_count" default="10"/>
+    <arg name="offboard_permission_source" default="manual_control"/>
+
+    <!--
+        trajectory_nx.py / controller_nx.py 中 master 角色使用 /master 前缀。
+        单机仿真中主机实际命名空间是 /uav0，所以这里统一映射到 /uav0。
+    -->
+    <remap from="/master/mavros/state" to="/$(arg self_id)/mavros/state"/>
+    <remap from="/master/mavros/local_position/pose" to="/$(arg self_id)/mavros/local_position/pose"/>
+    <remap from="/master/mavros/local_position/velocity_local" to="/$(arg self_id)/mavros/local_position/velocity_local"/>
+    <remap from="/master/mavros/setpoint_velocity/cmd_vel_unstamped" to="/$(arg self_id)/mavros/setpoint_velocity/cmd_vel_unstamped"/>
+    <remap from="/master/trajectory" to="/$(arg self_id)/trajectory"/>
+    <remap from="/master/state" to="/$(arg self_id)/state"/>
+
+    <include file="$(find aofe_star)/launch/sys_coop_lift_test_001_single_sim_template.launch">
+        <arg name="role" value="master"/>
+        <arg name="self_id" value="$(arg self_id)"/>
+        <arg name="participants" value=""/>
+        <arg name="run_id" value="$(arg run_id)"/>
+        <arg name="auto_start" value="$(arg auto_start)"/>
+        <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
+        <arg name="demo_mode" value="$(arg demo_mode)"/>
+        <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
+        <arg name="launch_trajectory" value="true"/>
+        <arg name="launch_controller" value="true"/>
+    </include>
+</launch>
