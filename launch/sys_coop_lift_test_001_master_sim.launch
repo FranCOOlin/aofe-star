@@ -12,6 +12,26 @@
     <arg name="max_send_count" default="10"/>
     <arg name="offboard_permission_source" default="manual_control"/>
 
+    <!-- RCIn 通道映射；offboard_permission_source=rc_in 时生效 -->
+    <arg name="offboard_switch_channel" default="9"/>
+    <arg name="offboard_switch_pos_threshold" default="1300"/>
+    <arg name="offboard_switch_high_threshold" default="1800"/>
+    <arg name="rc_task_takeoff_channel" default="12"/>
+    <arg name="rc_task_takeoff_threshold" default="1500"/>
+    <arg name="rc_task_takeoff_direction" default="above"/>
+    <arg name="rc_takeoff_advance_channel" default="10"/>
+    <arg name="rc_takeoff_advance_threshold" default="1800"/>
+    <arg name="rc_takeoff_advance_direction" default="above"/>
+    <arg name="rc_task_land_channel" default="5"/>
+    <arg name="rc_task_land_threshold" default="1800"/>
+    <arg name="rc_task_land_direction" default="above"/>
+    <arg name="rc_task_hook_channel" default="8"/>
+    <arg name="rc_task_hook_threshold" default="1800"/>
+    <arg name="rc_task_hook_direction" default="above"/>
+    <arg name="rc_emergency_hold_channel" default="11"/>
+    <arg name="rc_emergency_hold_threshold" default="1800"/>
+    <arg name="rc_emergency_hold_direction" default="above"/>
+
     <!--
         trajectory_nx.py / controller_nx.py 中 master 角色使用 /master 前缀。
         单机仿真中主机实际命名空间是 /uav0，所以这里统一映射到 /uav0。
@@ -33,6 +53,24 @@
         <arg name="demo_mode" value="$(arg demo_mode)"/>
         <arg name="max_send_count" value="$(arg max_send_count)"/>
         <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
+        <arg name="offboard_switch_channel" value="$(arg offboard_switch_channel)"/>
+        <arg name="offboard_switch_pos_threshold" value="$(arg offboard_switch_pos_threshold)"/>
+        <arg name="offboard_switch_high_threshold" value="$(arg offboard_switch_high_threshold)"/>
+        <arg name="rc_task_takeoff_channel" value="$(arg rc_task_takeoff_channel)"/>
+        <arg name="rc_task_takeoff_threshold" value="$(arg rc_task_takeoff_threshold)"/>
+        <arg name="rc_task_takeoff_direction" value="$(arg rc_task_takeoff_direction)"/>
+        <arg name="rc_takeoff_advance_channel" value="$(arg rc_takeoff_advance_channel)"/>
+        <arg name="rc_takeoff_advance_threshold" value="$(arg rc_takeoff_advance_threshold)"/>
+        <arg name="rc_takeoff_advance_direction" value="$(arg rc_takeoff_advance_direction)"/>
+        <arg name="rc_task_land_channel" value="$(arg rc_task_land_channel)"/>
+        <arg name="rc_task_land_threshold" value="$(arg rc_task_land_threshold)"/>
+        <arg name="rc_task_land_direction" value="$(arg rc_task_land_direction)"/>
+        <arg name="rc_task_hook_channel" value="$(arg rc_task_hook_channel)"/>
+        <arg name="rc_task_hook_threshold" value="$(arg rc_task_hook_threshold)"/>
+        <arg name="rc_task_hook_direction" value="$(arg rc_task_hook_direction)"/>
+        <arg name="rc_emergency_hold_channel" value="$(arg rc_emergency_hold_channel)"/>
+        <arg name="rc_emergency_hold_threshold" value="$(arg rc_emergency_hold_threshold)"/>
+        <arg name="rc_emergency_hold_direction" value="$(arg rc_emergency_hold_direction)"/>
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
     </include>

@@ -456,6 +456,12 @@ class TaskFSMNode:
         self.enable_px4_land_mode = bool(
             rospy.get_param("~enable_px4_land_mode", True)
         )
+        self.return_px4_modes = {
+            self._normalize_px4_mode(mode)
+            for mode in self._parse_csv_param(
+                rospy.get_param("~return_px4_modes", "AUTO.RTL,RTL,RETURN")
+            )
+        }
 
         # 收到 takeoff SCHEDULED 后，距离 t0 多少秒开始尝试 OFFBOARD / ARM
         self.prearm_before_t0 = float(
@@ -467,13 +473,18 @@ class TaskFSMNode:
             rospy.get_param("~offboard_in_takeoff_ready_after_cmd", True)
         )
 
-        # 三段拨杆通道，注意：这是遥控器第几通道，不是数组下标
-        # 第 7 通道对应 RCIn.channels[6]
+        # 三段拨杆通道，注意：这是遥控器第几通道，不是数组下标。
+        # 低位：idle，不请求任何模式；
+        # 中位：pos，请求 POSCTL；
+        # 高位：offboard，允许程序请求 OFFBOARD/ARM。
         self.offboard_switch_channel = int(
             rospy.get_param("~offboard_switch_channel", 7)
         )
 
-        # 三段拨杆高位阈值。通常三段为 1000 / 1500 / 2000
+        # 三段拨杆中位/高位阈值。通常三段为 1000 / 1500 / 2000。
+        self.offboard_switch_pos_threshold = int(
+            rospy.get_param("~offboard_switch_pos_threshold", 1300)
+        )
         self.offboard_switch_high_threshold = int(
             rospy.get_param("~offboard_switch_high_threshold", 1800)
         )
@@ -530,6 +541,18 @@ class TaskFSMNode:
         self.rc_task_hook_channel = int(
             rospy.get_param("~rc_task_hook_channel", 0)
         )
+        self.rc_task_takeoff_channel = int(
+            rospy.get_param(
+                "~rc_task_takeoff_channel",
+                rospy.get_param("~rc_takeoff_hold_channel", 0),
+            )
+        )
+        self.rc_takeoff_advance_channel = int(
+            rospy.get_param("~rc_takeoff_advance_channel", 0)
+        )
+        self.rc_emergency_hold_channel = int(
+            rospy.get_param("~rc_emergency_hold_channel", 0)
+        )
         rc_task_switch_default_threshold = int(
             rospy.get_param("~rc_task_switch_high_threshold", 1800)
         )
@@ -545,8 +568,44 @@ class TaskFSMNode:
         self.rc_task_hook_direction = str(
             rospy.get_param("~rc_task_hook_direction", "above")
         ).lower().strip()
+        self.rc_task_takeoff_threshold = int(
+            rospy.get_param(
+                "~rc_task_takeoff_threshold",
+                rospy.get_param(
+                    "~rc_takeoff_hold_threshold",
+                    rc_task_switch_default_threshold,
+                ),
+            )
+        )
+        self.rc_task_takeoff_direction = str(
+            rospy.get_param(
+                "~rc_task_takeoff_direction",
+                rospy.get_param("~rc_takeoff_hold_direction", "above"),
+            )
+        ).lower().strip()
+        self.rc_takeoff_advance_threshold = int(
+            rospy.get_param(
+                "~rc_takeoff_advance_threshold",
+                rc_task_switch_default_threshold,
+            )
+        )
+        self.rc_takeoff_advance_direction = str(
+            rospy.get_param("~rc_takeoff_advance_direction", "above")
+        ).lower().strip()
+        self.rc_emergency_hold_threshold = int(
+            rospy.get_param(
+                "~rc_emergency_hold_threshold",
+                rc_task_switch_default_threshold,
+            )
+        )
+        self.rc_emergency_hold_direction = str(
+            rospy.get_param("~rc_emergency_hold_direction", "above")
+        ).lower().strip()
 
-        # 当前三段拨杆是否允许程序干预,false 表示飞手拨回低/中档，不允许程序切 OFFBOARD；true 表示飞手拨到高位，允许程序切 OFFBOARD。
+        # CH9 三段开关模式：unknown / idle / pos / offboard。
+        self.rc_program_switch_mode = "unknown"
+
+        # 当前三段拨杆是否允许程序干预，只有 offboard 档为 True。
         self.rc_offboard_permission = False
 
         # 内部计时，避免频繁调用服务
@@ -612,6 +671,7 @@ class TaskFSMNode:
         self.manual_control_y = 0.0
         self.manual_control_z = 0.0
         self.manual_control_r = 0.0
+        self.task_switch_takeoff_active_last = False
         self.task_switch_hook_active_last = False
 
         self.self_check_report: Dict[str, Any] = {}
@@ -864,6 +924,10 @@ class TaskFSMNode:
 
         return [item.strip() for item in str(value).split(",") if item.strip()]
 
+    @staticmethod
+    def _normalize_px4_mode(mode: str) -> str:
+        return str(mode or "").strip().upper()
+
     # ============================================================
     # 自检输入回调
     # ============================================================
@@ -965,11 +1029,12 @@ class TaskFSMNode:
 
     def _update_rc_in_offboard_permission(self, t: float):
         """
-        根据 RCIn 中的三段拨杆通道刷新 OFFBOARD/ARM 许可。
+        根据 RCIn 中的三段拨杆通道刷新程序控制模式。
 
         offboard_switch_channel 是遥控器通道号，从 1 开始；
         RCIn.channels 是 Python 数组，从 0 开始。
         """
+        new_mode = "unknown"
         new_permission = False
 
         channel_index = self.offboard_switch_channel - 1
@@ -997,9 +1062,35 @@ class TaskFSMNode:
             )
         else:
             switch_value = int(self.rc_channels[channel_index])
-            new_permission = switch_value >= self.offboard_switch_high_threshold
+            new_mode = self._rc_program_switch_mode_from_value(switch_value)
+            new_permission = new_mode == "offboard"
 
+        self._set_rc_program_switch_mode(new_mode)
         self._set_offboard_permission(new_permission, "rc_in")
+
+    def _rc_program_switch_mode_from_value(self, value: int) -> str:
+        if value >= self.offboard_switch_high_threshold:
+            return "offboard"
+        if value >= self.offboard_switch_pos_threshold:
+            return "pos"
+        return "idle"
+
+    def _set_rc_program_switch_mode(self, new_mode: str):
+        old_mode = self.rc_program_switch_mode
+        if old_mode == new_mode:
+            return
+
+        self.rc_program_switch_mode = new_mode
+        rospy.logwarn(
+            "[%s TaskFSM] CH%s program switch mode changed: %s -> %s value=%s thresholds(pos=%s,offboard=%s)",
+            self.self_id,
+            self.offboard_switch_channel,
+            old_mode,
+            new_mode,
+            self._rc_channel_value(self.offboard_switch_channel),
+            self.offboard_switch_pos_threshold,
+            self.offboard_switch_high_threshold,
+        )
 
     def _update_manual_control_offboard_permission(self, t: float):
         """
@@ -1077,12 +1168,21 @@ class TaskFSMNode:
         """
         起飞运行阶段是否允许进入下一任务阶段。
 
+        slave：
+            不检测本机 rc_takeoff_advance_channel。
+            master 在自己的 advance 通道有效后，会通过
+            /<slave_id>/operator/enter_follow service 下发放行命令。
+
         manual_control 策略：
             SA=1 才允许 TASK_TAKEOFF_RUNNING -> TASK_WAIT_ENTER_FOLLOW_CMD。
 
         rc_in 策略：
-            先留占位，当前保持原流程，不额外卡住任务。
+            只有 master 读取本机 RCIn。
+            由 rc_takeoff_advance_channel 控制是否允许进入下一阶段。
         """
+        if self.role == "slave":
+            return self.cmd_enter_follow
+
         if self._is_manual_control_strategy():
             if not self._manual_control_fresh():
                 rospy.logwarn_throttle(
@@ -1109,6 +1209,19 @@ class TaskFSMNode:
         # TODO 实现RC策略
 
         return True
+
+    def _task_switch_takeoff_requested(self) -> bool:
+        """
+        RCIn 策略下，起飞只能由 rc_task_takeoff_channel 的上升沿触发。
+        """
+        active = False
+
+        if self._is_rc_in_strategy():
+            active = self._rc_task_switch_takeoff_requested()
+
+        requested = active and not self.task_switch_takeoff_active_last
+        self.task_switch_takeoff_active_last = active
+        return requested
 
     def _task_switch_land_requested(self) -> bool:
         """
@@ -1148,9 +1261,31 @@ class TaskFSMNode:
         self.task_switch_hook_active_last = active
         return requested
 
+    def _task_switch_emergency_hold_active(self) -> bool:
+        """
+        紧急 HOLD 通道是电平触发并锁存的安全输入。
+
+        只要任意一帧 RCIn 满足阈值，就会置 cmd_emergency_hold=True；
+        后续不依赖该通道保持 active。
+        """
+        return self._rc_task_switch_emergency_hold_active()
+
     def _rc_task_switch_takeoff_advance_allowed(self) -> bool:
-        # TODO: 后续有 RC 通道后，在这里实现 TAKEOFF_RUNNING 阶段推进开关。
-        return True
+        if self.rc_takeoff_advance_channel <= 0:
+            return True
+
+        return self._rc_channel_matches(
+            self.rc_takeoff_advance_channel,
+            self.rc_takeoff_advance_threshold,
+            self.rc_takeoff_advance_direction,
+        )
+
+    def _rc_task_switch_takeoff_requested(self) -> bool:
+        return self._rc_channel_matches(
+            self.rc_task_takeoff_channel,
+            self.rc_task_takeoff_threshold,
+            self.rc_task_takeoff_direction,
+        )
 
     def _rc_task_switch_land_requested(self) -> bool:
         return self._rc_channel_matches(
@@ -1164,6 +1299,13 @@ class TaskFSMNode:
             self.rc_task_hook_channel,
             self.rc_task_hook_threshold,
             self.rc_task_hook_direction,
+        )
+
+    def _rc_task_switch_emergency_hold_active(self) -> bool:
+        return self._rc_channel_matches(
+            self.rc_emergency_hold_channel,
+            self.rc_emergency_hold_threshold,
+            self.rc_emergency_hold_direction,
         )
 
     def _rc_channel_matches(self, channel: int, threshold: int, direction: str) -> bool:
@@ -1199,6 +1341,16 @@ class TaskFSMNode:
             channel,
         )
         return False
+
+    def _rc_channel_value(self, channel: int):
+        if channel <= 0:
+            return None
+
+        channel_index = channel - 1
+        if len(self.rc_channels) <= channel_index:
+            return None
+
+        return int(self.rc_channels[channel_index])
 
     def _handle_follow_stage_actions(self, return_state: str) -> bool:
         """
@@ -1252,7 +1404,7 @@ class TaskFSMNode:
         old=True, new=False:
             飞手从程序干预档拨回低/中档；
             程序停止抢 OFFBOARD；
-            如果当前在 OFFBOARD，则主动切 POSCTL；
+            只有拨到 CH9 中位 pos 时才请求 POSCTL；
             同时通知控制器进入人工接管 / passive。
 
         old=False, new=True:
@@ -1270,8 +1422,23 @@ class TaskFSMNode:
         )
 
         if old_permission and not new_permission:
+            if self.cmd_emergency_hold:
+                rospy.logwarn(
+                    "[%s TaskFSM] emergency hold is latched; skip POSCTL request on permission revoke",
+                    self.self_id,
+                )
+                return
+
+            if self.rc_program_switch_mode != "pos":
+                rospy.logwarn(
+                    "[%s TaskFSM] RC switch leaves OFFBOARD to %s; no mode request",
+                    self.self_id,
+                    self.rc_program_switch_mode,
+                )
+                return
+
             rospy.logwarn(
-                "[%s TaskFSM] RC switch leaves program-control position, request POSCTL",
+                "[%s TaskFSM] RC switch enters POS position, request POSCTL",
                 self.self_id,
             )
 
@@ -1313,13 +1480,16 @@ class TaskFSMNode:
 
     def _operator_takeoff_cb(self, msg: Bool):
         """
-        人工起飞指令。
+        兼容保留的人工起飞 topic。
 
-        只由 master 使用：
-            master 收到后，在 TASK_TAKEOFF_READY 状态下发起同步起飞。
+        实飞遥控器模式下，起飞只允许由 RCIn 的 rc_task_takeoff_channel 触发。
         """
         if msg.data:
-            self.cmd_takeoff = True
+            rospy.logwarn(
+                "[%s TaskFSM] ignore /operator/takeoff; takeoff is RC channel %s only",
+                self.self_id,
+                self.rc_task_takeoff_channel,
+            )
 
     def _operator_enter_follow_cb(self, msg: Bool):
         """
@@ -1496,6 +1666,15 @@ class TaskFSMNode:
         只要收到 emergency_hold 指令，就切入软件 HOLD。
         不交还 PX4 HOLD，由外部控制器持续发速度/位置保持指令。
         """
+        if self._task_switch_emergency_hold_active():
+            if not self.cmd_emergency_hold:
+                rospy.logerr(
+                    "[%s TaskFSM] RC emergency hold triggered on channel %s",
+                    self.self_id,
+                    self.rc_emergency_hold_channel,
+                )
+            self.cmd_emergency_hold = True
+
         if not self.cmd_emergency_hold:
             return
 
@@ -1522,7 +1701,6 @@ class TaskFSMNode:
             self.TASK_WAIT_ENTER_FOLLOW_CMD,
             self.TASK_FOLLOW_MASTER,
             self.TASK_HOOK_SEQUENCE_RUNNING,
-            self.TASK_LAND_RUNNING,
         ]:
             return True
 
@@ -1570,7 +1748,6 @@ class TaskFSMNode:
             self.TASK_WAIT_ENTER_FOLLOW_CMD,
             self.TASK_FOLLOW_MASTER,
             self.TASK_HOOK_SEQUENCE_RUNNING,
-            self.TASK_LAND_RUNNING,
         ]:
             return True
 
@@ -1588,6 +1765,12 @@ class TaskFSMNode:
 
         return False
 
+    def _is_return_px4_mode(self) -> bool:
+        return self._normalize_px4_mode(self.mavros_mode) in self.return_px4_modes
+
+    def _should_skip_offboard_pos_requests(self) -> bool:
+        return self.task_state == self.TASK_LAND_RUNNING or self._is_return_px4_mode()
+
     def _manage_offboard_and_arm_low_rate(self):
         """
         低频管理 PX4 OFFBOARD 和 ARM。
@@ -1595,8 +1778,9 @@ class TaskFSMNode:
         原则：
             1. FSM 不发布具体控制量；
             2. 控制量由外部控制节点持续发布；
-            3. FSM 只负责根据任务状态和三段拨杆许可，低频请求 OFFBOARD / ARM；
-            4. 拨杆不在高位时，绝不请求 OFFBOARD / ARM。
+            3. CH9 低位不请求任何模式；
+            4. CH9 中位低频请求 POSCTL；
+            5. CH9 高位才允许程序根据任务状态请求 OFFBOARD / ARM。
         """
         if not self.enable_offboard_manager:
             return
@@ -1611,6 +1795,37 @@ class TaskFSMNode:
 
         need_offboard = self._state_requires_offboard()
         need_arm = self._state_requires_arm()
+
+        if self._should_skip_offboard_pos_requests():
+            if (
+                self.task_state == self.TASK_LAND_RUNNING
+                or self.rc_program_switch_mode == "pos"
+                or need_offboard
+            ):
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s TaskFSM] state=%s px4_mode=%s; skip OFFBOARD/POSCTL requests",
+                    self.self_id,
+                    self.task_state,
+                    self.mavros_mode,
+                )
+            return
+
+        # CH9 中位是 POS 模式：持续限频请求 POSCTL。
+        # CH9 低位是 idle：不请求任何模式。
+        # emergency 锁存后不允许这里覆盖紧急 HOLD。
+        if (
+            self.rc_program_switch_mode == "pos"
+            and not self.cmd_emergency_hold
+            and self.task_state != self.TASK_LAND_RUNNING
+        ):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] CH%s is in POS position; keep requesting POSCTL",
+                self.self_id,
+                self.offboard_switch_channel,
+            )
+            self._request_position_mode()
 
         if not need_offboard and not need_arm:
             return
@@ -1684,6 +1899,16 @@ class TaskFSMNode:
             PX4 进入 OFFBOARD 前，外部控制节点必须已经持续发布 setpoint。
             这个函数不负责 setpoint。
         """
+        if self._should_skip_offboard_pos_requests():
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] skip OFFBOARD request in state=%s px4_mode=%s",
+                self.self_id,
+                self.task_state,
+                self.mavros_mode,
+            )
+            return
+
         t = now_sec()
 
         if t - self.last_set_mode_req_time < self.set_mode_min_interval:
@@ -1710,17 +1935,31 @@ class TaskFSMNode:
 
     def _request_position_mode(self):
         """
-        当前处于 OFFBOARD 时，请求 PX4 切回 POSCTL。
+        请求 PX4 切回 POSCTL。
         """
-        if self.mavros_mode != "OFFBOARD":
+        if self._should_skip_offboard_pos_requests():
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] skip POSCTL request in state=%s px4_mode=%s",
+                self.self_id,
+                self.task_state,
+                self.mavros_mode,
+            )
             return
 
         if not self.mavros_connected:
-            rospy.logwarn(
+            rospy.logwarn_throttle(
+                2.0,
                 "[%s TaskFSM] cannot request POSCTL, MAVROS not connected",
                 self.self_id,
             )
             return
+
+        t = now_sec()
+        if t - self.last_set_mode_req_time < self.set_mode_min_interval:
+            return
+
+        self.last_set_mode_req_time = t
 
         try:
             resp = self.set_mode_srv(custom_mode="POSCTL")
@@ -2006,13 +2245,21 @@ class TaskFSMNode:
             expected_action() 返回 "takeoff"。
 
         master：
-            只有收到人工起飞指令 /operator/takeoff 后，
+            只有 rc_task_takeoff_channel 上升沿触发后，
             才向 sync_gate_node 发起同步起飞 request。
 
         slave：
             不主动 request，只向 sync_gate_node 报告 ready_for_takeoff。
         """
         # self.publish_controller_hold(capture_current=False)
+
+        if self.role == "master" and self._task_switch_takeoff_requested():
+            self.cmd_takeoff = True
+            rospy.logwarn(
+                "[%s TaskFSM] RC takeoff switch triggered on channel %s",
+                self.self_id,
+                self.rc_task_takeoff_channel,
+            )
 
         if self.role == "master" and self.cmd_takeoff:
             self._master_request_sync_if_needed(
@@ -2023,6 +2270,13 @@ class TaskFSMNode:
                     "planner": "vertical_takeoff_planner",
                     "controller": "velocity_tracking_controller",
                 },
+            )
+        elif self.role == "master":
+            rospy.loginfo_throttle(
+                2.0,
+                "[%s TaskFSM] waiting RC takeoff switch channel %s",
+                self.self_id,
+                self.rc_task_takeoff_channel,
             )
 
     def _state_takeoff_running(self):
@@ -2046,7 +2300,25 @@ class TaskFSMNode:
         #     action="takeoff",
         # )
 
-        if self.check_takeoff_reached(tau) and self._task_switch_takeoff_advance_allowed():
+        takeoff_reached = self.check_takeoff_reached(tau)
+
+        if takeoff_reached and not self._task_switch_takeoff_advance_allowed():
+            if self.role == "master":
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s TaskFSM] takeoff reached; waiting RC takeoff advance channel %s",
+                    self.self_id,
+                    self.rc_takeoff_advance_channel,
+                )
+            else:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s TaskFSM] takeoff reached; waiting master takeoff advance command",
+                    self.self_id,
+                )
+            return
+
+        if takeoff_reached:
             self._finish_action()
             self._set_state(self.TASK_WAIT_ENTER_FOLLOW_CMD)
         else:
@@ -2055,7 +2327,7 @@ class TaskFSMNode:
                 "[%s TaskFSM] taking off... tau=%.1f reached=%s",
                 self.self_id,
                 tau,
-                self.check_takeoff_reached(tau),
+                takeoff_reached,
             )
 
     def _state_wait_enter_follow_cmd(self):
@@ -2664,6 +2936,8 @@ class TaskFSMNode:
         self.cmd_hook_sequence = False
         self.cmd_land = False
         self.cmd_emergency_hold = False
+        self.task_switch_takeoff_active_last = False
+        self.task_switch_hook_active_last = False
 
         self._finish_action()
 
@@ -2911,7 +3185,7 @@ class TaskFSMNode:
                 ),
             )
 
-        if ok and t - self.last_self_check_log_time >= self.self_check_log_period:
+        if ok:
             self.last_self_check_log_time = t
             rospy.loginfo(
                 "[%s TaskFSM] self check passed: %s",
@@ -3102,6 +3376,13 @@ class TaskFSMNode:
             return
 
         self.last_mission_state_pub_time = t
+        rc_takeoff_advance_value = None
+        rc_takeoff_advance_active = None
+        if self.role == "master":
+            rc_takeoff_advance_value = self._rc_channel_value(
+                self.rc_takeoff_advance_channel
+            )
+            rc_takeoff_advance_active = self._rc_task_switch_takeoff_advance_allowed()
 
         data = {
             "src": self.self_id,
@@ -3114,6 +3395,7 @@ class TaskFSMNode:
             "current_t0": self.current_t0,
             "request_in_flight": self.request_in_flight,
             "scheduled": self.scheduled_event is not None,
+            "return_mode_active": self._is_return_px4_mode(),
             "hook_released": self.hook_released,
             "rope_retracted": self.rope_retracted,
             "emergency_hold": self.task_state == self.TASK_EMERGENCY_HOLD,
@@ -3121,6 +3403,31 @@ class TaskFSMNode:
             "rc_offboard_permission": self.rc_offboard_permission,
             "offboard_permission_source": self.offboard_permission_source,
             "offboard_switch_channel": self.offboard_switch_channel,
+            "offboard_switch_value": self._rc_channel_value(self.offboard_switch_channel),
+            "offboard_switch_mode": self.rc_program_switch_mode,
+            "offboard_switch_pos_threshold": self.offboard_switch_pos_threshold,
+            "offboard_switch_high_threshold": self.offboard_switch_high_threshold,
+            "rc_task_takeoff_channel": self.rc_task_takeoff_channel,
+            "rc_task_takeoff_value": self._rc_channel_value(self.rc_task_takeoff_channel),
+            "rc_task_takeoff_active": self._rc_task_switch_takeoff_requested(),
+            "rc_takeoff_advance_channel": self.rc_takeoff_advance_channel,
+            "rc_takeoff_advance_value": rc_takeoff_advance_value,
+            "rc_takeoff_advance_active": rc_takeoff_advance_active,
+            "takeoff_advance_source": (
+                "local_rc_or_manual_control"
+                if self.role == "master"
+                else "master_enter_follow_service"
+            ),
+            "takeoff_advance_commanded": self.cmd_enter_follow,
+            "rc_task_hook_channel": self.rc_task_hook_channel,
+            "rc_task_hook_value": self._rc_channel_value(self.rc_task_hook_channel),
+            "rc_task_hook_active": self._rc_task_switch_hook_requested(),
+            "rc_emergency_hold_channel": self.rc_emergency_hold_channel,
+            "rc_emergency_hold_value": self._rc_channel_value(self.rc_emergency_hold_channel),
+            "rc_emergency_hold_active": self._rc_task_switch_emergency_hold_active(),
+            "rc_task_land_channel": self.rc_task_land_channel,
+            "rc_task_land_value": self._rc_channel_value(self.rc_task_land_channel),
+            "rc_task_land_active": self._rc_task_switch_land_requested(),
             "manual_control_buttons": self.manual_control_buttons,
             "manual_control_sb_bits": "{}{}".format(
                 (self.manual_control_buttons >> self.manual_control_sb_high_bit) & 0x01,

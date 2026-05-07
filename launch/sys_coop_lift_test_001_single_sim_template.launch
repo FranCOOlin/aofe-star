@@ -15,6 +15,26 @@
     <arg name="offboard_permission_source" default="always"/>
     <arg name="offboard_arm_request_delay" default="0.0"/>
 
+    <!-- RCIn 通道映射；offboard_permission_source=rc_in 时生效 -->
+    <arg name="offboard_switch_channel" default="9"/>
+    <arg name="offboard_switch_pos_threshold" default="1300"/>
+    <arg name="offboard_switch_high_threshold" default="1800"/>
+    <arg name="rc_task_takeoff_channel" default="12"/>
+    <arg name="rc_task_takeoff_threshold" default="1500"/>
+    <arg name="rc_task_takeoff_direction" default="above"/>
+    <arg name="rc_takeoff_advance_channel" default="10"/>
+    <arg name="rc_takeoff_advance_threshold" default="1800"/>
+    <arg name="rc_takeoff_advance_direction" default="above"/>
+    <arg name="rc_task_land_channel" default="5"/>
+    <arg name="rc_task_land_threshold" default="1800"/>
+    <arg name="rc_task_land_direction" default="above"/>
+    <arg name="rc_task_hook_channel" default="8"/>
+    <arg name="rc_task_hook_threshold" default="1800"/>
+    <arg name="rc_task_hook_direction" default="above"/>
+    <arg name="rc_emergency_hold_channel" default="11"/>
+    <arg name="rc_emergency_hold_threshold" default="1800"/>
+    <arg name="rc_emergency_hold_direction" default="above"/>
+
     <!-- 仿真总启动里可以只给主机启动轨迹/控制链路。 -->
     <arg name="launch_trajectory" default="false"/>
     <arg name="launch_controller" default="false"/>
@@ -132,14 +152,25 @@
         <param name="manual_control_hook_bit" value="2"/>
         <param name="manual_control_hook_value" value="1"/>
 
-        <param name="offboard_switch_channel" value="4"/>
-        <param name="offboard_switch_high_threshold" value="1800"/>
-        <param name="rc_task_land_channel" value="0"/>
-        <param name="rc_task_land_threshold" value="1800"/>
-        <param name="rc_task_land_direction" value="above"/>
-        <param name="rc_task_hook_channel" value="0"/>
-        <param name="rc_task_hook_threshold" value="1800"/>
-        <param name="rc_task_hook_direction" value="above"/>
+        <!-- CH9 三段程序控制开关：低位 idle / 中位 POSCTL / 高位 OFFBOARD -->
+        <param name="offboard_switch_channel" value="$(arg offboard_switch_channel)"/>
+        <param name="offboard_switch_pos_threshold" value="$(arg offboard_switch_pos_threshold)"/>
+        <param name="offboard_switch_high_threshold" value="$(arg offboard_switch_high_threshold)"/>
+        <param name="rc_task_takeoff_channel" value="$(arg rc_task_takeoff_channel)"/>
+        <param name="rc_task_takeoff_threshold" value="$(arg rc_task_takeoff_threshold)"/>
+        <param name="rc_task_takeoff_direction" value="$(arg rc_task_takeoff_direction)"/>
+        <param name="rc_takeoff_advance_channel" value="$(arg rc_takeoff_advance_channel)"/>
+        <param name="rc_takeoff_advance_threshold" value="$(arg rc_takeoff_advance_threshold)"/>
+        <param name="rc_takeoff_advance_direction" value="$(arg rc_takeoff_advance_direction)"/>
+        <param name="rc_task_land_channel" value="$(arg rc_task_land_channel)"/>
+        <param name="rc_task_land_threshold" value="$(arg rc_task_land_threshold)"/>
+        <param name="rc_task_land_direction" value="$(arg rc_task_land_direction)"/>
+        <param name="rc_task_hook_channel" value="$(arg rc_task_hook_channel)"/>
+        <param name="rc_task_hook_threshold" value="$(arg rc_task_hook_threshold)"/>
+        <param name="rc_task_hook_direction" value="$(arg rc_task_hook_direction)"/>
+        <param name="rc_emergency_hold_channel" value="$(arg rc_emergency_hold_channel)"/>
+        <param name="rc_emergency_hold_threshold" value="$(arg rc_emergency_hold_threshold)"/>
+        <param name="rc_emergency_hold_direction" value="$(arg rc_emergency_hold_direction)"/>
 
         <param name="set_mode_service" value="/$(arg self_id)/mavros/set_mode"/>
         <param name="arming_service" value="/$(arg self_id)/mavros/cmd/arming"/>

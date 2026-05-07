@@ -1,44 +1,253 @@
 <launch>
     <!-- ===================================================== -->
-    <!-- 基本身份参数                                          -->
+    <!-- 常用启动参数：每台无人机各自启动这个 launch              -->
     <!-- ===================================================== -->
 
-    <!-- 当前节点角色：master 或 slave -->
-    <arg name="role" default="slave"/>
-
-    <!-- 当前机器 ID：master / uav1 / uav2 / uav4 ... -->
-    <arg name="self_id" default="uav4"/>
-
     <!--
-        master 需要等待的 slave 列表，一般不包含 master 自己。
+        participants 放在最前面方便修改。
+        它是 master 需要等待的 slave 列表，一般不包含 master 自己。
+        所有机器上这个参数要保持一致；单机 master 调试可传 participants:=。
 
-        示例：
-        1）单从机 uav4：
-            participants:=uav4
-
-        2）两台从机 uav1 和 uav4：
-            participants:=uav1,uav4
-
-        3）如果当前这台机是 slave，这个参数保持和 master 一致即可。
+        三机实飞示例：
+            uav0: role:=master self_id:=uav0 participants:=uav1,uav2
+            uav1: role:=slave  self_id:=uav1 participants:=uav1,uav2
+            uav2: role:=slave  self_id:=uav2 participants:=uav1,uav2
     -->
-    <arg name="participants" default="uav4"/>
-    <!-- <arg name="participants" default="uav1,uav4"/> -->
+    <arg name="participants" default="uav1,uav2"/>
 
-    <!-- 本次实验流程 ID，建议所有机器保持一致 -->
+    <!-- 当前节点角色：master 或 slave；uav0 通常作为 master -->
+    <arg name="role" default="master"/>
+
+    <!-- 当前机器 ID：从 uav0 开始；slave 依次用 uav1/uav2/... -->
+    <arg name="self_id" default="uav0"/>
+
+    <!-- 本次实验流程 ID；所有机器必须保持一致，避免不同实验流程互相响应 -->
     <arg name="run_id" default="coop_lift_test_001"/>
 
-    <!-- 只有 master 的 auto_start 有意义；一般建议 false，等待人工 topic 触发 -->
-    <arg name="auto_start" default="false"/>
+    <!-- 只有 master 的 auto_start 有意义；实飞建议 false，等待人工 topic 触发 -->
+    <arg name="auto_start" default="true"/>
 
-    <!-- 主循环频率 -->
+    <!-- 主循环频率，task_fsm_node 和 sync_gate_node 共用 -->
     <arg name="control_rate_hz" default="50.0"/>
 
-    <!-- 是否 demo 模式：true 时部分检查会用时间条件自动通过，实飞建议 false -->
+    <!-- demo 模式；true 时部分检查会用时间条件自动通过，实飞建议 false -->
     <arg name="demo_mode" default="false"/>
 
-    <!-- 向其他节点发送起飞参数的最大次数，超过后不再发，实飞建议 10 次就好，防止发的太多 -->
+    <!-- 向其他节点发送起飞参数的最大次数；实飞建议 10，防止重复发送过多 -->
     <arg name="max_send_count" default="10"/>
+
+    <!-- 是否绕过自检；实飞建议 false，自动流程测试可设 true -->
+    <arg name="self_check_bypass" default="false"/>
+
+    <!-- 是否要求 MAVROS 已连接 FCU；实飞建议 true -->
+    <arg name="require_mavros_connected" default="true"/>
+
+    <!-- 是否要求 GPS fix 正常；室内/无 GPS 联调可设 false -->
+    <arg name="require_gps" default="true"/>
+
+    <!-- 是否要求 EKF 状态正常；实飞建议 true -->
+    <arg name="require_ekf" default="true"/>
+
+    <!-- 是否要求遥控器 RCIn 正常；使用实体遥控器时建议 true -->
+    <arg name="require_rc" default="true"/>
+
+    <!-- 起飞目标高度，单位 m -->
+    <arg name="takeoff_height" default="3.0"/>
+
+    <!-- 起飞轨迹持续时间，单位 s -->
+    <arg name="takeoff_duration" default="6.0"/>
+
+    <!-- 判断到达起飞高度的误差阈值，单位 m -->
+    <arg name="takeoff_reached_tolerance" default="0.25"/>
+
+    <!-- 松钩后等待多少秒再收绳 -->
+    <arg name="hook_to_retract_delay" default="5.0"/>
+
+    <!-- 降落超时 / demo 模式下落地判据时间，单位 s -->
+    <arg name="land_timeout" default="30.0"/>
+
+    <!-- ===================================================== -->
+    <!-- OFFBOARD / ARM / 人工控制参数                          -->
+    <!-- ===================================================== -->
+
+    <!-- OFFBOARD/ARM 许可来源：manual_control / rc_in / always；实体遥控器使用 rc_in -->
+    <arg name="offboard_permission_source" default="rc_in"/>
+
+    <!-- 收到同步起飞计划后，延迟多少秒再请求 OFFBOARD/ARM；多机可错峰设置 -->
     <arg name="offboard_arm_request_delay" default="0.0"/>
+
+    <!-- OFFBOARD/ARM 管理频率，单位 Hz；不宜过高，避免频繁刷服务 -->
+    <arg name="offboard_manage_rate" default="4.0"/>
+
+    <!-- PX4 Return/RTL 模式保护；当前模式命中这些值时，不再请求 OFFBOARD 或 POSCTL -->
+    <arg name="return_px4_modes" default="AUTO.RTL,RTL,RETURN"/>
+
+    <!-- set_mode 服务请求最小间隔，单位 s -->
+    <arg name="set_mode_min_interval" default="0.3"/>
+
+    <!-- arming 服务请求最小间隔，单位 s -->
+    <arg name="arm_min_interval" default="0.3"/>
+
+    <!-- QGC joystick MANUAL_CONTROL 超时时间，单位 s -->
+    <arg name="manual_control_timeout" default="1.0"/>
+
+    <!-- MANUAL_CONTROL 中 SB 三段开关高位 bit -->
+    <arg name="manual_control_sb_high_bit" default="7"/>
+
+    <!-- MANUAL_CONTROL 中 SB 三段开关低位 bit -->
+    <arg name="manual_control_sb_low_bit" default="6"/>
+
+    <!-- MANUAL_CONTROL 中任务阶段开关 bit -->
+    <arg name="manual_control_sa_bit" default="3"/>
+
+    <!-- MANUAL_CONTROL 中任务阶段开关允许值 -->
+    <arg name="manual_control_sa_active_value" default="1"/>
+
+    <!-- MANUAL_CONTROL 中降落触发开关 bit -->
+    <arg name="manual_control_sd_bit" default="1"/>
+
+    <!-- MANUAL_CONTROL 中降落触发开关有效值 -->
+    <arg name="manual_control_sd_land_value" default="1"/>
+
+    <!-- MANUAL_CONTROL 中松钩触发开关 bit -->
+    <arg name="manual_control_hook_bit" default="2"/>
+
+    <!-- MANUAL_CONTROL 中松钩触发开关有效值 -->
+    <arg name="manual_control_hook_value" default="1"/>
+
+    <!-- RCIn 模式下 CH9 三段程序控制开关；第 9 通道对应 RCIn.channels[8] -->
+    <!-- 低位：idle，不请求模式；中位：POSCTL；高位：OFFBOARD/ARM 许可 -->
+    <arg name="offboard_switch_channel" default="9"/>
+
+    <!-- RCIn 模式下 CH9 中位 POSCTL 阈值，通常中位约 1500 -->
+    <arg name="offboard_switch_pos_threshold" default="1300"/>
+
+    <!-- RCIn 模式下 CH9 高位 OFFBOARD/ARM 许可阈值，通常高位约 2000 -->
+    <arg name="offboard_switch_high_threshold" default="1800"/>
+
+    <!-- RCIn 模式下同步起飞触发通道；第 12 通道对应 RCIn.channels[11]，上升沿触发一次 takeoff -->
+    <arg name="rc_task_takeoff_channel" default="12"/>
+
+    <!-- RCIn 模式下同步起飞触发阈值 -->
+    <arg name="rc_task_takeoff_threshold" default="1500"/>
+
+    <!-- RCIn 模式下同步起飞触发方向：above 或 below -->
+    <arg name="rc_task_takeoff_direction" default="above"/>
+
+    <!-- RCIn 模式下起飞到高度后允许进入下一阶段通道；仅 master 检测，slave 等待 master 下发 enter_follow -->
+    <!-- 第 10 通道对应 RCIn.channels[9]，电平触发，不要求保持 -->
+    <arg name="rc_takeoff_advance_channel" default="10"/>
+
+    <!-- RCIn 模式下起飞到高度后允许进入下一阶段阈值 -->
+    <arg name="rc_takeoff_advance_threshold" default="1800"/>
+
+    <!-- RCIn 模式下起飞到高度后允许进入下一阶段方向：above 或 below -->
+    <arg name="rc_takeoff_advance_direction" default="above"/>
+
+    <!-- RCIn 模式下降落触发通道；第 5 通道对应 RCIn.channels[4]，电平触发，不要求保持 -->
+    <arg name="rc_task_land_channel" default="5"/>
+
+    <!-- RCIn 模式下降落触发阈值 -->
+    <arg name="rc_task_land_threshold" default="1800"/>
+
+    <!-- RCIn 模式下降落触发方向：above 或 below -->
+    <arg name="rc_task_land_direction" default="above"/>
+
+    <!-- RCIn 模式下松钩/收绳触发通道；第 8 通道对应 RCIn.channels[7] -->
+    <arg name="rc_task_hook_channel" default="8"/>
+
+    <!-- RCIn 模式下松钩触发阈值 -->
+    <arg name="rc_task_hook_threshold" default="1800"/>
+
+    <!-- RCIn 模式下松钩触发方向：above 或 below -->
+    <arg name="rc_task_hook_direction" default="above"/>
+
+    <!-- RCIn 模式下紧急 HOLD 触发通道；第 11 通道对应 RCIn.channels[10]，触发后锁存进入 emergency hold -->
+    <arg name="rc_emergency_hold_channel" default="11"/>
+
+    <!-- RCIn 模式下紧急 HOLD 触发阈值 -->
+    <arg name="rc_emergency_hold_threshold" default="1800"/>
+
+    <!-- RCIn 模式下紧急 HOLD 触发方向：above 或 below -->
+    <arg name="rc_emergency_hold_direction" default="above"/>
+
+    <!-- ===================================================== -->
+    <!-- 同步器参数                                            -->
+    <!-- ===================================================== -->
+
+    <!-- master 收齐 ACK_PREPARE 后生成 t0 = now + sync_start_delay -->
+    <arg name="sync_start_delay" default="5.0"/>
+
+    <!-- t0 至少要距离当前时间的安全余量，单位 s -->
+    <arg name="sync_min_t0_margin" default="1.0"/>
+
+    <!-- 本机 task_fsm 状态超时，单位 s -->
+    <arg name="task_status_timeout" default="1.0"/>
+
+    <!-- master 判断 slave 全局状态是否过期的超时，单位 s -->
+    <arg name="global_status_timeout" default="4.0"/>
+
+    <!-- PREPARE 阶段等待 ACK_PREPARE 的最长时间，单位 s -->
+    <arg name="prepare_timeout" default="3.0"/>
+
+    <!-- COMMIT 阶段等待 ACK_COMMIT 的最长时间，单位 s -->
+    <arg name="commit_timeout" default="3.0"/>
+
+    <!-- ABORT 重复广播持续时间，单位 s -->
+    <arg name="abort_duration" default="2.0"/>
+
+    <!-- 同步命令广播频率，单位 Hz -->
+    <arg name="sync_command_rate" default="5.0"/>
+
+    <!-- 同步 ACK 发布频率，单位 Hz -->
+    <arg name="sync_ack_rate" default="5.0"/>
+
+    <!-- 全局状态发布频率，单位 Hz -->
+    <arg name="sync_global_status_rate" default="1.0"/>
+
+    <!-- ===================================================== -->
+    <!-- 本机节点开关                                          -->
+    <!-- ===================================================== -->
+
+    <!-- 是否启动 trajectory_nx.py；实飞默认 true，联调可设 false -->
+    <arg name="launch_trajectory" default="true"/>
+
+    <!-- 是否启动 controller_nx.py；实飞默认 true，联调可设 false -->
+    <arg name="launch_controller" default="true"/>
+
+    <!-- 是否启动 MAVROS px4.launch；如果外部已经启动 MAVROS，可设 false -->
+    <arg name="launch_mavros" default="true"/>
+
+    <!-- ===================================================== -->
+    <!-- MAVROS / GCS 参数                                     -->
+    <!-- ===================================================== -->
+
+    <!-- FCU 串口或 UDP 连接地址；实机串口常用 /dev/ttyUSB0:1000000 -->
+    <arg name="fcu_url" default="/dev/ttyUSB0:460800"/>
+
+    <!-- 地面站 / QGroundControl 所在主机 IP；请改成 GCS 电脑的局域网 IP -->
+    <arg name="gcs_host" default="192.168.2.50"/>
+
+    <!-- 地面站 / QGroundControl 默认 MAVLink UDP 监听端口 -->
+    <arg name="gcs_port" default="14551"/>
+
+    <!-- MAVROS 转发给 GCS 的 MAVLink URL；不需要转发时可启动时传 gcs_url:= -->
+    <arg name="gcs_url" default="udp://@$(arg gcs_host):$(arg gcs_port)"/>
+
+    <!-- MAVLink target system；应与当前 FCU 的 MAV_SYS_ID 一致，建议 uav0=1/uav1=2/uav2=3 -->
+    <arg name="tgt_system" default="1"/>
+
+    <!-- MAVLink target component；PX4 autopilot 通常为 1 -->
+    <arg name="tgt_component" default="1"/>
+
+    <!-- MAVROS 输出方式：screen 或 log -->
+    <arg name="log_output" default="screen"/>
+
+    <!-- MAVLink 协议版本；PX4 建议 v2.0 -->
+    <arg name="fcu_protocol" default="v2.0"/>
+
+    <!-- MAVROS 退出后是否自动重启 -->
+    <arg name="respawn_mavros" default="false"/>
 
     <!-- ===================================================== -->
     <!-- 任务状态机节点 task_fsm_node                           -->
@@ -73,12 +282,12 @@
         <!-- ================================================= -->
 
         <!-- 实飞建议 false；自动流程测试可以 true -->
-        <param name="self_check_bypass" value="false"/>
+        <param name="self_check_bypass" value="$(arg self_check_bypass)"/>
 
-        <param name="require_mavros_connected" value="true"/>
-        <param name="require_gps" value="true"/>
-        <param name="require_ekf" value="true"/>
-        <param name="require_rc" value="false"/>
+        <param name="require_mavros_connected" value="$(arg require_mavros_connected)"/>
+        <param name="require_gps" value="$(arg require_gps)"/>
+        <param name="require_ekf" value="$(arg require_ekf)"/>
+        <param name="require_rc" value="$(arg require_rc)"/>
 
         <param name="mavros_state_timeout" value="1.0"/>
         <param name="gps_timeout" value="1.0"/>
@@ -109,22 +318,23 @@
         <param name="extended_state_topic" value="/$(arg self_id)/mavros/extended_state"/>
         <param name="estimator_status_topic" value="/$(arg self_id)/mavros/estimator_status"/>
         <param name="rc_in_topic" value="/$(arg self_id)/mavros/rc/in"/>
+        <param name="manual_control_topic" value="/$(arg self_id)/mavros/manual_control/control"/>
 
         <param name="self_check_log_period" value="1.0"/>
 
         <!-- 起飞任务参数 -->
-        <param name="takeoff_height" value="3.0"/>
-        <param name="takeoff_duration" value="6.0"/>
-        <param name="takeoff_reached_tolerance" value="0.25"/>
+        <param name="takeoff_height" value="$(arg takeoff_height)"/>
+        <param name="takeoff_duration" value="$(arg takeoff_duration)"/>
+        <param name="takeoff_reached_tolerance" value="$(arg takeoff_reached_tolerance)"/>
         <param name="trajectory_reset_service" value="/$(arg self_id)/trajectory/reset"/>
         <param name="trajectory_reset_service_timeout" value="0.05"/>
         <param name="trajectory_reset_retry_interval" value="1.0"/>
 
         <!-- 松钩后等待多少秒收绳 -->
-        <param name="hook_to_retract_delay" value="5.0"/>
+        <param name="hook_to_retract_delay" value="$(arg hook_to_retract_delay)"/>
 
         <!-- 降落超时 / demo 模式下的落地判据时间 -->
-        <param name="land_timeout" value="30.0"/>
+        <param name="land_timeout" value="$(arg land_timeout)"/>
 
         <!-- ================================================= -->
         <!-- task_fsm_node 与 sync_gate_node 的本机通信 topic    -->
@@ -152,6 +362,9 @@
 
         <!-- 给松钩/收绳执行器的命令 -->
         <param name="hook_command_topic" value="/$(arg self_id)/hook/command"/>
+
+        <!-- 给轨迹节点的起飞参数 -->
+        <param name="takeoff_param_topic" value="/$(arg self_id)/takeoff/param"/>
 
         <!-- ================================================= -->
         <!-- 人工指令 topic                                     -->
@@ -181,18 +394,19 @@
         <param name="auto_arm" value="true"/>
 
         <!-- OFFBOARD 管理频率，建议 1~2Hz -->
-        <param name="offboard_manage_rate" value="4.0"/>
+        <param name="offboard_manage_rate" value="$(arg offboard_manage_rate)"/>
         <param name="offboard_arm_request_delay" value="$(arg offboard_arm_request_delay)"/>
 
         <!-- 服务请求最小间隔，避免刷服务 -->
-        <param name="set_mode_min_interval" value="0.3"/>
-        <param name="arm_min_interval" value="0.3"/>
+        <param name="set_mode_min_interval" value="$(arg set_mode_min_interval)"/>
+        <param name="arm_min_interval" value="$(arg arm_min_interval)"/>
         <param name="master_pilot_hold_px4_mode" value="AUTO.LOITER"/>
         <param name="enable_master_pilot_hold_mode" value="true"/>
         <param name="emergency_hold_px4_mode" value="AUTO.LOITER"/>
         <param name="enable_emergency_hold_mode" value="true"/>
         <param name="land_px4_mode" value="AUTO.LAND"/>
         <param name="enable_px4_land_mode" value="true"/>
+        <param name="return_px4_modes" value="$(arg return_px4_modes)"/>
 
         <!-- 收到 takeoff SCHEDULED 后，距离 t0 多少秒开始尝试 OFFBOARD / ARM -->
         <param name="prearm_before_t0" value="3.0"/>
@@ -200,19 +414,45 @@
         <!-- TAKEOFF_READY 且收到 takeoff 指令后是否提前允许 OFFBOARD -->
         <param name="offboard_in_takeoff_ready_after_cmd" value="true"/>
 
-        <!-- 三段拨杆通道：第 7 通道，对应 RCIn.channels[6] -->
-        <param name="offboard_switch_channel" value="7"/>
+        <!--
+            OFFBOARD/任务许可来源：
+            manual_control 使用 QGC joystick -> MAVLink MANUAL_CONTROL 的 buttons 位；
+            rc_in 使用 /mavros/rc/in 的通道阈值；
+            always 仅用于调试，始终允许程序切 OFFBOARD/ARM。
+        -->
+        <param name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
+        <param name="manual_control_timeout" value="$(arg manual_control_timeout)"/>
+        <param name="manual_control_sb_high_bit" value="$(arg manual_control_sb_high_bit)"/>
+        <param name="manual_control_sb_low_bit" value="$(arg manual_control_sb_low_bit)"/>
+        <param name="manual_control_sa_bit" value="$(arg manual_control_sa_bit)"/>
+        <param name="manual_control_sa_active_value" value="$(arg manual_control_sa_active_value)"/>
+        <param name="manual_control_sd_bit" value="$(arg manual_control_sd_bit)"/>
+        <param name="manual_control_sd_land_value" value="$(arg manual_control_sd_land_value)"/>
+        <param name="manual_control_hook_bit" value="$(arg manual_control_hook_bit)"/>
+        <param name="manual_control_hook_value" value="$(arg manual_control_hook_value)"/>
 
-        <!-- 三段拨杆高位阈值，通常高位约 2000 -->
-        <param name="offboard_switch_high_threshold" value="1800"/>
-        <param name="manual_control_hook_bit" value="2"/>
-        <param name="manual_control_hook_value" value="1"/>
-        <param name="rc_task_land_channel" value="0"/>
-        <param name="rc_task_land_threshold" value="1800"/>
-        <param name="rc_task_land_direction" value="above"/>
-        <param name="rc_task_hook_channel" value="0"/>
-        <param name="rc_task_hook_threshold" value="1800"/>
-        <param name="rc_task_hook_direction" value="above"/>
+        <!-- RCIn 兼容参数；offboard_permission_source=rc_in 时生效 -->
+        <!-- CH9 三段程序控制开关：低位 idle / 中位 POSCTL / 高位 OFFBOARD -->
+        <param name="offboard_switch_channel" value="$(arg offboard_switch_channel)"/>
+
+        <!-- 三段拨杆中位/高位阈值，通常三段为 1000 / 1500 / 2000 -->
+        <param name="offboard_switch_pos_threshold" value="$(arg offboard_switch_pos_threshold)"/>
+        <param name="offboard_switch_high_threshold" value="$(arg offboard_switch_high_threshold)"/>
+        <param name="rc_task_takeoff_channel" value="$(arg rc_task_takeoff_channel)"/>
+        <param name="rc_task_takeoff_threshold" value="$(arg rc_task_takeoff_threshold)"/>
+        <param name="rc_task_takeoff_direction" value="$(arg rc_task_takeoff_direction)"/>
+        <param name="rc_takeoff_advance_channel" value="$(arg rc_takeoff_advance_channel)"/>
+        <param name="rc_takeoff_advance_threshold" value="$(arg rc_takeoff_advance_threshold)"/>
+        <param name="rc_takeoff_advance_direction" value="$(arg rc_takeoff_advance_direction)"/>
+        <param name="rc_task_land_channel" value="$(arg rc_task_land_channel)"/>
+        <param name="rc_task_land_threshold" value="$(arg rc_task_land_threshold)"/>
+        <param name="rc_task_land_direction" value="$(arg rc_task_land_direction)"/>
+        <param name="rc_task_hook_channel" value="$(arg rc_task_hook_channel)"/>
+        <param name="rc_task_hook_threshold" value="$(arg rc_task_hook_threshold)"/>
+        <param name="rc_task_hook_direction" value="$(arg rc_task_hook_direction)"/>
+        <param name="rc_emergency_hold_channel" value="$(arg rc_emergency_hold_channel)"/>
+        <param name="rc_emergency_hold_threshold" value="$(arg rc_emergency_hold_threshold)"/>
+        <param name="rc_emergency_hold_direction" value="$(arg rc_emergency_hold_direction)"/>
 
         <!-- MAVROS service，默认 Python 已按 self_id 拼接，这里写上更直观 -->
         <param name="set_mode_service" value="/$(arg self_id)/mavros/set_mode"/>
@@ -245,32 +485,32 @@
             最终 t0 在 master 收齐 ACK_PREPARE 后生成：
                 t0 = now + start_delay
         -->
-        <param name="start_delay" value="5.0"/>
-        <param name="min_t0_margin" value="1.0"/>
+        <param name="start_delay" value="$(arg sync_start_delay)"/>
+        <param name="min_t0_margin" value="$(arg sync_min_t0_margin)"/>
 
         <!-- 本机 task_fsm 状态超时 -->
-        <param name="task_status_timeout" value="1.0"/>
+        <param name="task_status_timeout" value="$(arg task_status_timeout)"/>
 
         <!-- master 判断 slave /sync/status 是否过期 -->
-        <param name="global_status_timeout" value="4.0"/>
+        <param name="global_status_timeout" value="$(arg global_status_timeout)"/>
 
         <!-- PREPARE 阶段等待 ACK_PREPARE 的最长时间 -->
-        <param name="prepare_timeout" value="3.0"/>
+        <param name="prepare_timeout" value="$(arg prepare_timeout)"/>
 
         <!-- COMMIT 阶段等待 ACK_COMMIT 的最长时间 -->
-        <param name="commit_timeout" value="3.0"/>
+        <param name="commit_timeout" value="$(arg commit_timeout)"/>
 
         <!-- ABORT 重复广播持续时间 -->
-        <param name="abort_duration" value="2.0"/>
+        <param name="abort_duration" value="$(arg abort_duration)"/>
 
         <!--
             机间带宽宝贵时：
             command_rate / ack_rate 不需要太高，5Hz 足够。
             global_status_rate 可以低频，1Hz 用于预检查。
         -->
-        <param name="command_rate" value="5.0"/>
-        <param name="ack_rate" value="5.0"/>
-        <param name="global_status_rate" value="1.0"/>
+        <param name="command_rate" value="$(arg sync_command_rate)"/>
+        <param name="ack_rate" value="$(arg sync_ack_rate)"/>
+        <param name="global_status_rate" value="$(arg sync_global_status_rate)"/>
 
         <!-- 多机同步器之间的全局 topic -->
         <param name="command_topic" value="/sync/command"/>
@@ -287,15 +527,19 @@
     <!-- ===================================================== -->
     <!-- 轨迹与控制节点                                         -->
     <!-- ===================================================== -->
-    <node pkg="aofe_star"
+    <node if="$(arg launch_trajectory)"
+          pkg="aofe_star"
           type="trajectory_nx.py"
           name="$(arg self_id)_trajectory"
           output="screen">
         <param name="self_id" value="$(arg self_id)"/>
         <param name="role" value="$(arg role)"/>
+        <param name="takeoff_param_topic" value="/$(arg self_id)/takeoff/param"/>
+        <param name="trajectory_reset_service" value="/$(arg self_id)/trajectory/reset"/>
     </node>
 
-    <node pkg="aofe_star"
+    <node if="$(arg launch_controller)"
+          pkg="aofe_star"
           type="controller_nx.py"
           name="$(arg self_id)_controller"
           output="screen">
@@ -307,14 +551,7 @@
     <!-- ===================================================== -->
     <!-- 启动 px4                                              -->
     <!-- ===================================================== -->
-    <arg name="fcu_url" default="/dev/ttyUSB0:1000000" />
-    <arg name="gcs_url" default="" />
-    <arg name="tgt_system" default="1" />
-    <arg name="tgt_component" default="1" />
-    <arg name="log_output" default="screen" />
-    <arg name="fcu_protocol" default="v2.0" />
-    <arg name="respawn_mavros" default="false" />
-    <!-- <group ns="$(arg self_id)">
+    <group if="$(arg launch_mavros)" ns="$(arg self_id)">
         <include file="$(find mavros)/launch/px4.launch" >
             <arg name="fcu_url" value="$(arg fcu_url)" />
             <arg name="gcs_url" value="$(arg gcs_url)" />
@@ -324,7 +561,7 @@
             <arg name="fcu_protocol" value="$(arg fcu_protocol)" />
             <arg name="respawn_mavros" value="$(arg respawn_mavros)" />
         </include>
-    </group> -->
+    </group>
 
 
 </launch>
