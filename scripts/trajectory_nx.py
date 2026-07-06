@@ -53,6 +53,8 @@ class Trajectory():
         self.Leader_current_mode = ''
         self.self_armed = False
         self.last_self_armed = None
+        self.leader_armed = False
+        self.last_leader_armed = None
         self.rate = rospy.Rate(self.trajectory_rate)
         self.uav_id = rospy.get_param('~self_id','')
         self.role = rospy.get_param('~role','')
@@ -157,6 +159,7 @@ class Trajectory():
 
     def Leader_state_callback(self, data):
         self.Leader_current_mode = data.mode
+        self.leader_armed = data.armed
 
     def self_state_callback(self, data):
         self.self_armed = data.armed
@@ -193,24 +196,64 @@ class Trajectory():
         rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, resetting internal state.", self.uav_id)
         return TriggerResponse(success=True, message="trajectory reset done")
 
-    def refresh_z_reference_on_disarm(self):
+    def reset_leader_reference(self, reason):
+        old_x = self.initial_pose_x_Leader
+        old_y = self.initial_pose_y_Leader
+        old_z = self.initial_pose_z_Leader
+        self.initial_pose_x_Leader = self.Leader_pose.pose.position.x
+        self.initial_pose_y_Leader = self.Leader_pose.pose.position.y
+        self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
+        rospy.logwarn(
+            "[%s TrajectoryNode] %s, reset leader reference: x %.3f -> %.3f, y %.3f -> %.3f, z %.3f -> %.3f",
+            self.uav_id,
+            reason,
+            old_x,
+            self.initial_pose_x_Leader,
+            old_y,
+            self.initial_pose_y_Leader,
+            old_z,
+            self.initial_pose_z_Leader,
+        )
+
+    def reset_follower_reference(self, reason):
+        old_x = self.initial_pose_x
+        old_y = self.initial_pose_y
+        old_z = self.initial_pose_z
+        self.initial_pose_x = self.Follower_pose.pose.position.x
+        self.initial_pose_y = self.Follower_pose.pose.position.y
+        self.initial_pose_z = self.Follower_pose.pose.position.z
+        rospy.logwarn(
+            "[%s TrajectoryNode] %s, reset follower reference: x %.3f -> %.3f, y %.3f -> %.3f, z %.3f -> %.3f",
+            self.uav_id,
+            reason,
+            old_x,
+            self.initial_pose_x,
+            old_y,
+            self.initial_pose_y,
+            old_z,
+            self.initial_pose_z,
+        )
+
+    def refresh_reference_on_arm(self):
         if self.last_self_armed is None:
             self.last_self_armed = self.self_armed
-            return
-
-        if self.last_self_armed and not self.self_armed:
+        elif not self.last_self_armed and self.self_armed:
             if self.uav_id == '/uav0':
-                old_z = self.initial_pose_z_Leader
-                self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
-                rospy.logwarn("[%s TrajectoryNode] disarmed, reset leader z reference only: %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z_Leader)
+                self.reset_leader_reference("armed")
             else:
-                old_z = self.initial_pose_z
-                old_leader_z = self.initial_pose_z_Leader
-                self.initial_pose_z = self.Follower_pose.pose.position.z
-                self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
-                rospy.logwarn("[%s TrajectoryNode] disarmed, reset z references only: follower %.3f -> %.3f, leader %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z, old_leader_z, self.initial_pose_z_Leader)
+                self.reset_follower_reference("armed")
 
         self.last_self_armed = self.self_armed
+
+        if self.uav_id == '/uav0':
+            return
+
+        if self.last_leader_armed is None:
+            self.last_leader_armed = self.leader_armed
+        elif not self.last_leader_armed and self.leader_armed:
+            self.reset_leader_reference("leader armed")
+
+        self.last_leader_armed = self.leader_armed
     
     def set_height(self, time, takeoff_duration, x_stay, y_stay, target_height, Leader_height, Follower_height):
         odom = Odometry()
@@ -255,7 +298,7 @@ class Trajectory():
                     self.takeoff_init_finished = True
                     rospy.logerr("[%s TrajectoryNode] Leader initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x_Leader, self.initial_pose_y_Leader, self.initial_pose_z_Leader)
 
-                self.refresh_z_reference_on_disarm()
+                self.refresh_reference_on_arm()
                 self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
 
                 if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD": # 当前若是leader,那也只有offboard有意义
@@ -308,6 +351,8 @@ class Trajectory():
                     self.initial_pose_x = self.Follower_pose.pose.position.x
                     self.initial_pose_y = self.Follower_pose.pose.position.y
                     self.initial_pose_z = self.Follower_pose.pose.position.z
+                    self.initial_pose_x_Leader = self.Leader_pose.pose.position.x
+                    self.initial_pose_y_Leader = self.Leader_pose.pose.position.y
                     self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
                     if self.first_init:
                         self.offset_x, self.offset_y = self.latlon_delta_to_meters(self.lon, self.lat, self.Lead_lon, self.Lead_lat)
@@ -316,7 +361,7 @@ class Trajectory():
                     rospy.logerr("[%s TrajectoryNode] Follower initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x, self.initial_pose_y, self.initial_pose_z)
                     self.takeoff_init_finished = True
                 
-                self.refresh_z_reference_on_disarm()
+                self.refresh_reference_on_arm()
                 self.Follower_relative_z = self.Follower_pose.pose.position.z - self.initial_pose_z
                 self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
                 roll, pitch, self.Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
