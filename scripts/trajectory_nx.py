@@ -51,6 +51,8 @@ class Trajectory():
         self.Leader_relative_z = 0.0
         self.Follower_relative_z = 0.0
         self.Leader_current_mode = ''
+        self.self_armed = False
+        self.last_self_armed = None
         self.rate = rospy.Rate(self.trajectory_rate)
         self.uav_id = rospy.get_param('~self_id','')
         self.role = rospy.get_param('~role','')
@@ -78,10 +80,11 @@ class Trajectory():
             queue_size = 50,
         )
         if self.uav_id == '/uav0':
-            rospy.Subscriber('/uav0/mavros/state', State, self.Leader_state_callback)
+            rospy.Subscriber('/uav0/mavros/state', State, self.self_leader_state_callback)
             rospy.Subscriber("/uav0/mavros/local_position/pose", PoseStamped, self.Leader_pose_and_att_callback)
             rospy.Subscriber("/uav0/mavros/local_position/velocity_local", TwistStamped, self.Leader_vel_callback)
         else:
+            rospy.Subscriber(self.uav_id + '/mavros/state', State, self.self_state_callback)
             rospy.Subscriber('/uav0/mavros/state', State, self.Leader_state_callback)
             rospy.Subscriber("/uav0/mavros/local_position/pose", PoseStamped, self.Leader_pose_and_att_callback)
             rospy.Subscriber(self.uav_id + "/mavros/local_position/pose", PoseStamped, self.Follower_pose_and_att_callback)
@@ -155,6 +158,13 @@ class Trajectory():
     def Leader_state_callback(self, data):
         self.Leader_current_mode = data.mode
 
+    def self_state_callback(self, data):
+        self.self_armed = data.armed
+
+    def self_leader_state_callback(self, data):
+        self.self_state_callback(data)
+        self.Leader_state_callback(data)
+
     def Leader_pose_and_att_callback(self, data):
         self.Leader_pose = data
 
@@ -182,6 +192,25 @@ class Trajectory():
         self.follow_flag = False
         rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, resetting internal state.", self.uav_id)
         return TriggerResponse(success=True, message="trajectory reset done")
+
+    def refresh_z_reference_on_disarm(self):
+        if self.last_self_armed is None:
+            self.last_self_armed = self.self_armed
+            return
+
+        if self.last_self_armed and not self.self_armed:
+            if self.uav_id == '/uav0':
+                old_z = self.initial_pose_z_Leader
+                self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
+                rospy.logwarn("[%s TrajectoryNode] disarmed, reset leader z reference only: %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z_Leader)
+            else:
+                old_z = self.initial_pose_z
+                old_leader_z = self.initial_pose_z_Leader
+                self.initial_pose_z = self.Follower_pose.pose.position.z
+                self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
+                rospy.logwarn("[%s TrajectoryNode] disarmed, reset z references only: follower %.3f -> %.3f, leader %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z, old_leader_z, self.initial_pose_z_Leader)
+
+        self.last_self_armed = self.self_armed
     
     def set_height(self, time, takeoff_duration, x_stay, y_stay, target_height, Leader_height, Follower_height):
         odom = Odometry()
@@ -226,6 +255,7 @@ class Trajectory():
                     self.takeoff_init_finished = True
                     rospy.logerr("[%s TrajectoryNode] Leader initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x_Leader, self.initial_pose_y_Leader, self.initial_pose_z_Leader)
 
+                self.refresh_z_reference_on_disarm()
                 self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
 
                 if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD": # 当前若是leader,那也只有offboard有意义
@@ -268,6 +298,7 @@ class Trajectory():
             rospy.wait_for_message("/uav0/mavros/local_position/velocity_local", TwistStamped)
             rospy.wait_for_message(self.uav_id + '/mavros/local_position/velocity_local', TwistStamped)
             rospy.wait_for_message('/uav0/mavros/state', State)
+            rospy.wait_for_message(self.uav_id + '/mavros/state', State)
             rospy.wait_for_message(self.uav_id + "/mavros/global_position/global", NavSatFix)
             rospy.wait_for_message("/uav0/mavros/global_position/global", NavSatFix)
             rospy.loginfo("Follower trajectory node start.")
@@ -285,6 +316,7 @@ class Trajectory():
                     rospy.logerr("[%s TrajectoryNode] Follower initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x, self.initial_pose_y, self.initial_pose_z)
                     self.takeoff_init_finished = True
                 
+                self.refresh_z_reference_on_disarm()
                 self.Follower_relative_z = self.Follower_pose.pose.position.z - self.initial_pose_z
                 self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
                 roll, pitch, self.Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
