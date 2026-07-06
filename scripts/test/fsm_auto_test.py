@@ -25,12 +25,13 @@ fsm_auto_test.py
     /sync/command
     /sync/ack
     /<id>/mission/state
-    /<id>/task/sync_status
-    /<id>/task/sync_request
-    /<id>/task/sync_event
     /<id>/planner/request
     /<id>/controller/command
     /<id>/hook/command
+
+注意：
+    /<id>/task/sync_status、sync_request、sync_event 已改为 ROS service，
+    本测试节点不再旁路监听这三条本机同步接口。
 
 运行示例：
     rosrun aofe_star fsm_auto_test.py _master_id:=master _vehicle_ids:=master,uav4
@@ -122,9 +123,6 @@ class FsmAutoTest:
 
         self.mission_state: Dict[str, dict] = {}
         self.sync_status: Dict[str, dict] = {}
-        self.task_sync_status: Dict[str, dict] = {}
-        self.task_sync_event: Dict[str, dict] = {}
-        self.task_sync_request: Dict[str, dict] = {}
         self.controller_command: Dict[str, dict] = {}
         self.planner_request: Dict[str, dict] = {}
         self.hook_command: Dict[str, dict] = {}
@@ -186,27 +184,6 @@ class FsmAutoTest:
                 f"/{vid}/mission/state",
                 String,
                 self._mission_state_cb_factory(vid),
-                queue_size=100,
-            )
-
-            rospy.Subscriber(
-                f"/{vid}/task/sync_status",
-                String,
-                self._task_sync_status_cb_factory(vid),
-                queue_size=100,
-            )
-
-            rospy.Subscriber(
-                f"/{vid}/task/sync_request",
-                String,
-                self._task_sync_request_cb_factory(vid),
-                queue_size=100,
-            )
-
-            rospy.Subscriber(
-                f"/{vid}/task/sync_event",
-                String,
-                self._task_sync_event_cb_factory(vid),
                 queue_size=100,
             )
 
@@ -322,50 +299,6 @@ class FsmAutoTest:
                     "emergency_hold",
                 ],
             )
-        return cb
-
-    def _task_sync_status_cb_factory(self, vid: str):
-        def cb(msg: String):
-            data = safe_json_loads(msg.data)
-            if not data:
-                self._print(f"/{vid}/task/sync_status/raw", msg.data)
-                return
-
-            with self.lock:
-                self.task_sync_status[vid] = data
-
-            self._print_on_change(
-                key=f"task_sync_status:{vid}",
-                tag=f"/{vid}/task/sync_status",
-                data=data,
-                field_list=["task_state", "ready", "expected_action", "current_action"],
-            )
-        return cb
-
-    def _task_sync_request_cb_factory(self, vid: str):
-        def cb(msg: String):
-            data = safe_json_loads(msg.data)
-            if not data:
-                self._print(f"/{vid}/task/sync_request/raw", msg.data)
-                return
-
-            with self.lock:
-                self.task_sync_request[vid] = data
-
-            self._print(f"/{vid}/task/sync_request", data)
-        return cb
-
-    def _task_sync_event_cb_factory(self, vid: str):
-        def cb(msg: String):
-            data = safe_json_loads(msg.data)
-            if not data:
-                self._print(f"/{vid}/task/sync_event/raw", msg.data)
-                return
-
-            with self.lock:
-                self.task_sync_event[vid] = data
-
-            self._print(f"/{vid}/task/sync_event", data)
         return cb
 
     def _planner_request_cb_factory(self, vid: str):

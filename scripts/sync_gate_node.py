@@ -10,16 +10,18 @@ sync_gate_node.py
 核心设计：
     1. sync_gate_node 只负责同步协议，不负责具体任务。
     2. task_fsm_node 只负责任务状态机，不负责 PREPARE / COMMIT / ACK。
-    3. 两个节点之间只通过本机 topic 通信。
+    3. 两个节点之间只通过本机 service 通信。
     4. 多机之间只由各自的 sync_gate_node 通信。
 
-本机 topic：
+本机 service：
     task_fsm_node -> sync_gate_node:
         /<self_id>/task/sync_status
         /<self_id>/task/sync_request
 
     sync_gate_node -> task_fsm_node:
         /<self_id>/task/sync_event
+
+    上面三个接口均使用 aofe_star/JsonPayload.srv，payload 是 JSON 字符串。
 
 多机 topic：
     /sync/command
@@ -59,6 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import rospy
 from std_msgs.msg import String
+from aofe_star.srv import JsonPayload, JsonPayloadResponse
 
 
 # ============================================================
@@ -329,7 +332,8 @@ class SyncGateNode:
         self.global_status_topic = rospy.get_param("~global_status_topic", "/sync/status")
 
         # -----------------------------
-        # 本机 task_fsm_node 与 sync_gate_node 之间的 topic
+        # 本机 task_fsm_node 与 sync_gate_node 之间的 service
+        # 参数名保留 *_topic，是为了兼容已有 launch 文件。
         # -----------------------------
         self.task_status_topic = rospy.get_param(
             "~task_status_topic",
@@ -370,6 +374,9 @@ class SyncGateNode:
         self.abort_duration = float(rospy.get_param("~abort_duration", 2.0))
 
         self.require_ready_status = bool(rospy.get_param("~require_ready_status", True))
+        self.task_event_service_timeout = float(
+            rospy.get_param("~task_event_service_timeout", 0.2)
+        )
 
         # -----------------------------
         # 同步器内部状态
@@ -401,7 +408,7 @@ class SyncGateNode:
         self.lock = threading.RLock()
 
         # -----------------------------
-        # ROS pub/sub
+        # ROS pub/sub/service
         # -----------------------------
         self.command_pub = rospy.Publisher(self.command_topic, String, queue_size=50)
         self.ack_pub = rospy.Publisher(self.ack_topic, String, queue_size=100)
@@ -410,11 +417,7 @@ class SyncGateNode:
             String,
             queue_size=100,
         )
-        self.task_event_pub = rospy.Publisher(
-            self.task_event_topic,
-            String,
-            queue_size=50,
-        )
+        self.task_event_srv = rospy.ServiceProxy(self.task_event_topic, JsonPayload)
 
         rospy.Subscriber(self.command_topic, String, self._command_cb, queue_size=100)
         rospy.Subscriber(self.ack_topic, String, self._ack_cb, queue_size=100)
@@ -425,17 +428,15 @@ class SyncGateNode:
             queue_size=100,
         )
 
-        rospy.Subscriber(
+        self.task_status_srv = rospy.Service(
             self.task_status_topic,
-            String,
-            self._task_status_cb,
-            queue_size=100,
+            JsonPayload,
+            self._task_status_srv,
         )
-        rospy.Subscriber(
+        self.task_request_srv = rospy.Service(
             self.task_request_topic,
-            String,
-            self._task_request_cb,
-            queue_size=20,
+            JsonPayload,
+            self._task_request_srv,
         )
 
         rospy.loginfo(
@@ -450,37 +451,39 @@ class SyncGateNode:
     # 本机 task_fsm_node -> sync_gate_node
     # ============================================================
 
-    def _task_status_cb(self, msg: String):
+    def _task_status_srv(self, req):
         """
-        接收本机 task_fsm_node 发布的任务状态。
+        接收本机 task_fsm_node 上报的任务状态。
 
         这个状态用于判断：
             本机是否可以参与某个 action 的同步。
         """
-        data = safe_json_loads(msg.data)
+        data = safe_json_loads(req.payload)
         if not data:
-            return
+            return JsonPayloadResponse(False, "invalid_json", "")
 
         if data.get("src", "") != self.self_id:
-            return
+            return JsonPayloadResponse(False, "src_mismatch", "")
 
         with self.lock:
             self.local_task_status = data
             self.local_task_status_time = now_sec()
 
-    def _task_request_cb(self, msg: String):
+        return JsonPayloadResponse(True, "ok", "")
+
+    def _task_request_srv(self, req):
         """
         接收本机 task_fsm_node 的同步申请。
 
         只有 master 同步器会接受 request。
         slave 同步器如果收到 request，会直接拒绝。
         """
-        data = safe_json_loads(msg.data)
+        data = safe_json_loads(req.payload)
         if not data:
-            return
+            return JsonPayloadResponse(False, "invalid_json", "")
 
         if data.get("src", "") != self.self_id:
-            return
+            return JsonPayloadResponse(False, "src_mismatch", "")
 
         action = sanitize_id(data.get("action", ""))
         payload = data.get("payload", {})
@@ -489,7 +492,7 @@ class SyncGateNode:
         participants = parse_list(data.get("participants", [])) or self.default_participants
 
         if not action:
-            self._publish_task_event(
+            event_data = self._make_task_event(
                 event_type=EVENT_REQUEST_REJECTED,
                 action="",
                 payload={},
@@ -498,10 +501,10 @@ class SyncGateNode:
                 reason="empty_action",
                 extra={"request_id": request_id},
             )
-            return
+            return self._json_response(False, "empty_action", event_data)
 
         if self.role != "master":
-            self._publish_task_event(
+            event_data = self._make_task_event(
                 event_type=EVENT_REQUEST_REJECTED,
                 action=action,
                 payload=payload,
@@ -510,13 +513,13 @@ class SyncGateNode:
                 reason="only_master_can_request_sync",
                 extra={"request_id": request_id},
             )
-            return
+            return self._json_response(False, "only_master_can_request_sync", event_data)
 
         with self.lock:
-            ok, reason = self._start_new_sync(action, payload, participants)
+            ok, reason, event_data = self._start_new_sync(action, payload, participants)
 
         if not ok:
-            self._publish_task_event(
+            event_data = self._make_task_event(
                 event_type=EVENT_REQUEST_REJECTED,
                 action=action,
                 payload=payload,
@@ -525,8 +528,22 @@ class SyncGateNode:
                 reason=reason,
                 extra={"request_id": request_id},
             )
+            return self._json_response(False, reason, event_data)
 
-    def _publish_task_event(
+        return self._json_response(True, reason, event_data)
+
+    def _json_response(self, ok: bool, reason: str, payload: Optional[Dict[str, Any]] = None):
+        payload_text = ""
+        if isinstance(payload, dict):
+            payload_text = json.dumps(payload, separators=(",", ":"))
+
+        return JsonPayloadResponse(
+            ok=bool(ok),
+            reason=reason,
+            payload=payload_text,
+        )
+
+    def _make_task_event(
         self,
         event_type: str,
         action: str,
@@ -535,12 +552,7 @@ class SyncGateNode:
         t0: float,
         reason: str = "",
         extra: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        向本机 task_fsm_node 发布事件。
-
-        这是同步器对任务层的唯一输出。
-        """
+    ) -> Dict[str, Any]:
         data = {
             "event": event_type,
             "src": self.self_id,
@@ -559,9 +571,58 @@ class SyncGateNode:
             data["run_id"] = self.current_sync.run_id
             data["sync_seq"] = self.current_sync.sync_seq
 
-        self.task_event_pub.publish(
-            String(data=json.dumps(data, separators=(",", ":")))
+        return data
+
+    def _publish_task_event(
+        self,
+        event_type: str,
+        action: str,
+        payload: Optional[Dict[str, Any]],
+        sync_id: str,
+        t0: float,
+        reason: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        向本机 task_fsm_node 发布事件。
+
+        这是同步器对任务层的唯一输出。
+        """
+        data = self._make_task_event(
+            event_type=event_type,
+            action=action,
+            payload=payload,
+            sync_id=sync_id,
+            t0=t0,
+            reason=reason,
+            extra=extra,
         )
+
+        payload_text = json.dumps(data, separators=(",", ":"))
+
+        try:
+            rospy.wait_for_service(
+                self.task_event_topic,
+                timeout=self.task_event_service_timeout,
+            )
+            resp = self.task_event_srv(payload_text)
+        except (rospy.ROSException, rospy.ServiceException) as e:
+            rospy.logwarn_throttle(
+                2.0,
+                "[SyncGate %s] task_event service call failed name=%s err=%s",
+                self.self_id,
+                self.task_event_topic,
+                str(e),
+            )
+            return
+
+        if not resp.ok:
+            rospy.logwarn(
+                "[SyncGate %s] task_event service returned not ok name=%s reason=%s",
+                self.self_id,
+                self.task_event_topic,
+                resp.reason,
+            )
 
     # ============================================================
     # master：开始一次新的同步
@@ -572,7 +633,7 @@ class SyncGateNode:
         action: str,
         payload: Dict[str, Any],
         participants: List[str],
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
         master 根据本机 TaskFSM 的 sync_request，创建新的同步会话。
 
@@ -582,15 +643,15 @@ class SyncGateNode:
             最终 t0 在收齐所有 ACK_PREPARE 后生成。
         """
         if self.current_sync is not None or self.sync_state != SYNC_IDLE:
-            return False, f"sync_busy:{self.sync_state}"
+            return False, f"sync_busy:{self.sync_state}", None
 
         ok, reason = self._check_local_task_ready(action)
         if not ok:
-            return False, f"local_task_not_ready:{reason}"
+            return False, f"local_task_not_ready:{reason}", None
 
         ok, reason = self._check_all_remote_ready(action, participants)
         if not ok:
-            return False, reason
+            return False, reason, None
 
         self.sync_seq += 1
 
@@ -619,7 +680,7 @@ class SyncGateNode:
 
         # 通知 master 本机 TaskFSM：
         # 请求已被接受，但还没有最终 t0。
-        self._publish_task_event(
+        event_data = self._make_task_event(
             event_type=EVENT_REQUEST_ACCEPTED,
             action=action,
             payload=payload,
@@ -628,7 +689,7 @@ class SyncGateNode:
             reason="prepare_started",
         )
 
-        return True, "ok"
+        return True, "ok", event_data
 
     def _check_local_task_ready(self, action: str) -> Tuple[bool, str]:
         """

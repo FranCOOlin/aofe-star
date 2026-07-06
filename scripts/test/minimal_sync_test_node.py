@@ -21,6 +21,8 @@ minimal_sync_test_node.py
 
     sync_gate_node -> minimal_sync_test_node:
         /<self_id>/task/sync_event
+
+    上面三个接口均使用 aofe_star/JsonPayload.srv，payload 是 JSON 字符串。
 """
 
 import json
@@ -28,6 +30,7 @@ from typing import Optional
 
 import rospy
 from std_msgs.msg import String, Bool
+from aofe_star.srv import JsonPayload, JsonPayloadResponse
 
 
 EVENT_REQUEST_ACCEPTED = "REQUEST_ACCEPTED"
@@ -69,6 +72,7 @@ class MinimalSyncTestNode:
         self.status_rate = float(rospy.get_param("~test_status_rate", 10.0))
         self.request_rate = float(rospy.get_param("~test_request_rate", 1.0))
         self.loop_rate = float(rospy.get_param("~loop_rate", 50.0))
+        self.sync_service_timeout = float(rospy.get_param("~sync_service_timeout", 0.2))
         self.auto_reset = bool(rospy.get_param("~auto_reset", True))
 
         self.task_status_topic = rospy.get_param(
@@ -108,17 +112,8 @@ class MinimalSyncTestNode:
 
         self.cmd_start = False
 
-        self.status_pub = rospy.Publisher(
-            self.task_status_topic,
-            String,
-            queue_size=50,
-        )
-
-        self.request_pub = rospy.Publisher(
-            self.task_request_topic,
-            String,
-            queue_size=20,
-        )
+        self.status_srv = rospy.ServiceProxy(self.task_status_topic, JsonPayload)
+        self.request_srv = rospy.ServiceProxy(self.task_request_topic, JsonPayload)
 
         self.result_pub = rospy.Publisher(
             self.result_topic,
@@ -126,11 +121,10 @@ class MinimalSyncTestNode:
             queue_size=20,
         )
 
-        rospy.Subscriber(
+        self.task_event_srv = rospy.Service(
             self.task_event_topic,
-            String,
-            self._event_cb,
-            queue_size=50,
+            JsonPayload,
+            self._event_srv,
         )
 
         rospy.Subscriber(
@@ -157,11 +151,15 @@ class MinimalSyncTestNode:
             self.cmd_start = True
             rospy.loginfo("[%s MinimalSyncTest] received start command", self.self_id)
 
-    def _event_cb(self, msg: String):
-        data = safe_json_loads(msg.data)
+    def _event_srv(self, req):
+        data = safe_json_loads(req.payload)
         if not data:
-            return
+            return JsonPayloadResponse(False, "invalid_json", "")
 
+        self._handle_event(data)
+        return JsonPayloadResponse(True, "ok", "")
+
+    def _handle_event(self, data: dict):
         event = data.get("event", "")
         action = data.get("action", "")
 
@@ -244,6 +242,54 @@ class MinimalSyncTestNode:
 
             rate.sleep()
 
+    def _call_json_service(
+        self,
+        service_proxy,
+        service_name: str,
+        data: dict,
+        label: str,
+        handle_response_event: bool = False,
+    ):
+        payload_text = json.dumps(data, separators=(",", ":"))
+
+        try:
+            rospy.wait_for_service(service_name, timeout=self.sync_service_timeout)
+            resp = service_proxy(payload_text)
+        except (rospy.ROSException, rospy.ServiceException) as e:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s MinimalSyncTest] %s service call failed name=%s err=%s",
+                self.self_id,
+                label,
+                service_name,
+                str(e),
+            )
+            return None
+
+        if handle_response_event and resp.payload:
+            event_data = safe_json_loads(resp.payload)
+            if event_data:
+                self._handle_event(event_data)
+            else:
+                rospy.logwarn(
+                    "[%s MinimalSyncTest] %s service returned invalid event json: %s",
+                    self.self_id,
+                    label,
+                    resp.payload,
+                )
+
+        if not resp.ok and not (handle_response_event and resp.payload):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s MinimalSyncTest] %s service returned not ok name=%s reason=%s",
+                self.self_id,
+                label,
+                service_name,
+                resp.reason,
+            )
+
+        return resp
+
     def _publish_status_periodically(self):
         t = now_sec()
         period = 1.0 / max(self.status_rate, 1e-6)
@@ -267,8 +313,11 @@ class MinimalSyncTestNode:
             "current_sync_id": self.current_sync_id,
         }
 
-        self.status_pub.publish(
-            String(data=json.dumps(data, separators=(",", ":")))
+        self._call_json_service(
+            self.status_srv,
+            self.task_status_topic,
+            data,
+            "sync_status",
         )
 
     def _master_request_sync_if_needed(self):
@@ -304,12 +353,16 @@ class MinimalSyncTestNode:
             },
         }
 
-        self.request_pub.publish(
-            String(data=json.dumps(data, separators=(",", ":")))
+        self._call_json_service(
+            self.request_srv,
+            self.task_request_topic,
+            data,
+            "sync_request",
+            handle_response_event=True,
         )
 
         rospy.loginfo(
-            "[%s MinimalSyncTest] publish sync_request action=%s request_id=%s",
+            "[%s MinimalSyncTest] call sync_request action=%s request_id=%s",
             self.self_id,
             self.action_name,
             request_id,

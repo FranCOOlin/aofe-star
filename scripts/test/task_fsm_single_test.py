@@ -6,6 +6,9 @@ task_fsm_single_test.py
 
 单机测试 task_fsm_node.py + sync_gate_node.py 的 master 流程。
 
+本机同步接口已改为 ROS service，测试节点不再旁路监听
+/<self_id>/task/sync_status、sync_request、sync_event。
+
 典型用法：
     roslaunch aofe_star sys_coop_lift_test_001_master_sim.launch demo_mode:=true
 
@@ -94,27 +97,6 @@ class TaskFSMSingleTest:
             f"/{self.self_id}/mission/state",
             String,
             self._mission_state_cb,
-            queue_size=100,
-        )
-        rospy.Subscriber(
-            f"/{self.self_id}/task/sync_status",
-            String,
-            self._print_json_on_change_cb(
-                f"/{self.self_id}/task/sync_status",
-                ["task_state", "ready", "expected_action", "current_action"],
-            ),
-            queue_size=100,
-        )
-        rospy.Subscriber(
-            f"/{self.self_id}/task/sync_request",
-            String,
-            self._print_json_cb(f"/{self.self_id}/task/sync_request"),
-            queue_size=100,
-        )
-        rospy.Subscriber(
-            f"/{self.self_id}/task/sync_event",
-            String,
-            self._print_json_cb(f"/{self.self_id}/task/sync_event"),
             queue_size=100,
         )
         rospy.Subscriber(

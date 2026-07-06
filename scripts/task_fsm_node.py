@@ -11,7 +11,7 @@ task_fsm_node.py
     1. 本文件只负责任务状态机。
     2. 不处理 PREPARE / COMMIT / ACK，这些属于 sync_gate_node。
     3. 不直接调用 sync_gate_node 对象。
-    4. 只通过本机 topic 和 sync_gate_node 交互。
+    4. 只通过本机 service 和 sync_gate_node 交互。
     5. 不是所有状态切换都需要同步器。
        只有“多机必须同时进入”的动作才通过同步器。
 
@@ -22,6 +22,8 @@ task_fsm_node.py
 
     sync_gate_node -> task_fsm_node:
         /<self_id>/task/sync_event
+
+    上面三个接口均使用 aofe_star/JsonPayload.srv，payload 是 JSON 字符串。
 
 外部模块接口：
     1. 轨迹规划器：
@@ -53,6 +55,7 @@ from std_msgs.msg import String, Bool
 from sensor_msgs.msg import NavSatFix
 from mavros_msgs.msg import State, RCIn, ManualControl, ExtendedState
 from std_srvs.srv import Trigger, TriggerResponse
+from aofe_star.srv import JsonPayload, JsonPayloadResponse
 
 try:
     from mavros_msgs.msg import EstimatorStatus
@@ -170,7 +173,8 @@ class TaskFSMNode:
             raise RuntimeError("~role must be master or slave")
 
         # ========================================================
-        # 本机同步接口 topic
+        # 本机同步接口 service
+        # 参数名保留 *_topic，是为了兼容已有 launch 文件。
         # ========================================================
 
         self.task_status_topic = rospy.get_param(
@@ -266,6 +270,7 @@ class TaskFSMNode:
         self.status_rate = float(rospy.get_param("~task_status_rate", 20.0))
         self.mission_state_rate = float(rospy.get_param("~mission_state_rate", 10.0))
         self.request_rate = float(rospy.get_param("~task_request_rate", 1.0))
+        self.sync_service_timeout = float(rospy.get_param("~sync_service_timeout", 0.2))
         self.auto_start = bool(rospy.get_param("~auto_start", False))
 
         # ========================================================
@@ -760,20 +765,11 @@ class TaskFSMNode:
         }
 
         # ========================================================
-        # ROS pub/sub
+        # ROS pub/sub/service
         # ========================================================
 
-        self.status_pub = rospy.Publisher(
-            self.task_status_topic,
-            String,
-            queue_size=50,
-        )
-
-        self.request_pub = rospy.Publisher(
-            self.task_request_topic,
-            String,
-            queue_size=20,
-        )
+        self.status_srv = rospy.ServiceProxy(self.task_status_topic, JsonPayload)
+        self.request_srv = rospy.ServiceProxy(self.task_request_topic, JsonPayload)
 
         self.mission_state_pub = rospy.Publisher(
             self.mission_state_topic,
@@ -805,11 +801,10 @@ class TaskFSMNode:
             queue_size=20,
         )
 
-        rospy.Subscriber(
+        self.task_event_srv = rospy.Service(
             self.task_event_topic,
-            String,
-            self._sync_event_cb,
-            queue_size=50,
+            JsonPayload,
+            self._sync_event_srv,
         )
 
         rospy.Subscriber(
@@ -1543,7 +1538,23 @@ class TaskFSMNode:
     # sync_gate_node -> task_fsm_node 事件回调
     # ============================================================
 
-    def _sync_event_cb(self, msg: String):
+    def _sync_event_srv(self, req):
+        data = safe_json_loads(req.payload)
+        if not data:
+            return JsonPayloadResponse(
+                ok=False,
+                reason="invalid_json",
+                payload="",
+            )
+
+        self._handle_sync_event(data)
+        return JsonPayloadResponse(
+            ok=True,
+            reason="ok",
+            payload="",
+        )
+
+    def _handle_sync_event(self, data: dict):
         """
         处理同步器发来的事件。
 
@@ -1555,10 +1566,6 @@ class TaskFSMNode:
             START
             ABORT
         """
-        data = safe_json_loads(msg.data)
-        if not data:
-            return
-
         event = data.get("event", "")
         action = data.get("action", "")
 
@@ -2486,6 +2493,54 @@ class TaskFSMNode:
     # 同步状态发布：TaskFSM -> SyncGate
     # ============================================================
 
+    def _call_json_service(
+        self,
+        service_proxy,
+        service_name: str,
+        data: Dict[str, Any],
+        label: str,
+        handle_response_event: bool = False,
+    ):
+        payload_text = json.dumps(data, separators=(",", ":"))
+
+        try:
+            rospy.wait_for_service(service_name, timeout=self.sync_service_timeout)
+            resp = service_proxy(payload_text)
+        except (rospy.ROSException, rospy.ServiceException) as e:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] %s service call failed name=%s err=%s",
+                self.self_id,
+                label,
+                service_name,
+                str(e),
+            )
+            return None
+
+        if handle_response_event and resp.payload:
+            event_data = safe_json_loads(resp.payload)
+            if event_data:
+                self._handle_sync_event(event_data)
+            else:
+                rospy.logwarn(
+                    "[%s TaskFSM] %s service returned invalid event json: %s",
+                    self.self_id,
+                    label,
+                    resp.payload,
+                )
+
+        if not resp.ok and not (handle_response_event and resp.payload):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] %s service returned not ok name=%s reason=%s",
+                self.self_id,
+                label,
+                service_name,
+                resp.reason,
+            )
+
+        return resp
+
     def _publish_sync_status_periodically(self):
         """
         发布给 sync_gate_node 的同步状态。
@@ -2518,8 +2573,11 @@ class TaskFSMNode:
             "current_sync_id": self.current_sync_id,
         }
 
-        self.status_pub.publish(
-            String(data=json.dumps(data, separators=(",", ":")))
+        self._call_json_service(
+            self.status_srv,
+            self.task_status_topic,
+            data,
+            "sync_status",
         )
 
     def expected_action(self) -> str:
@@ -2585,12 +2643,16 @@ class TaskFSMNode:
             "payload": payload,
         }
 
-        self.request_pub.publish(
-            String(data=json.dumps(data, separators=(",", ":")))
+        self._call_json_service(
+            self.request_srv,
+            self.task_request_topic,
+            data,
+            "sync_request",
+            handle_response_event=True,
         )
 
         rospy.loginfo(
-            "[master TaskFSM] publish sync_request action=%s request_id=%s",
+            "[master TaskFSM] call sync_request action=%s request_id=%s",
             action,
             request_id,
         )

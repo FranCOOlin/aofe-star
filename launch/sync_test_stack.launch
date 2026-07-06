@@ -36,7 +36,7 @@
         <param name="test_duration" value="3.0"/>
         <param name="auto_reset" value="true"/>
 
-        <!-- 和 sync_gate_node 的本机通信 topic -->
+        <!-- 和 sync_gate_node 的本机通信 service -->
         <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
         <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
         <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
@@ -86,7 +86,7 @@
         <param name="ack_topic" value="/sync/ack"/>
         <param name="global_status_topic" value="/sync/status"/>
 
-        <!-- 本机 minimal_sync_test_node 与 sync_gate_node 通信 topic -->
+        <!-- 本机 minimal_sync_test_node 与 sync_gate_node 通信 service -->
         <param name="task_status_topic" value="/$(arg self_id)/task/sync_status"/>
         <param name="task_request_topic" value="/$(arg self_id)/task/sync_request"/>
         <param name="task_event_topic" value="/$(arg self_id)/task/sync_event"/>
