@@ -53,6 +53,8 @@ class Trajectory():
         self.Leader_current_mode = ''
         self.self_armed = False
         self.last_self_armed = None
+        self.leader_armed = False
+        self.last_leader_armed = None
         self.rate = rospy.Rate(self.trajectory_rate)
         self.uav_id = rospy.get_param('~self_id','')
         self.role = rospy.get_param('~role','')
@@ -157,6 +159,7 @@ class Trajectory():
 
     def Leader_state_callback(self, data):
         self.Leader_current_mode = data.mode
+        self.leader_armed = data.armed
 
     def self_state_callback(self, data):
         self.self_armed = data.armed
@@ -196,21 +199,29 @@ class Trajectory():
     def refresh_z_reference_on_disarm(self):
         if self.last_self_armed is None:
             self.last_self_armed = self.self_armed
-            return
-
-        if self.last_self_armed and not self.self_armed:
+        elif self.last_self_armed and not self.self_armed:
             if self.uav_id == '/uav0':
                 old_z = self.initial_pose_z_Leader
                 self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
                 rospy.logwarn("[%s TrajectoryNode] disarmed, reset leader z reference only: %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z_Leader)
             else:
                 old_z = self.initial_pose_z
-                old_leader_z = self.initial_pose_z_Leader
                 self.initial_pose_z = self.Follower_pose.pose.position.z
-                self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
-                rospy.logwarn("[%s TrajectoryNode] disarmed, reset z references only: follower %.3f -> %.3f, leader %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z, old_leader_z, self.initial_pose_z_Leader)
+                rospy.logwarn("[%s TrajectoryNode] disarmed, reset follower z reference only: %.3f -> %.3f", self.uav_id, old_z, self.initial_pose_z)
 
         self.last_self_armed = self.self_armed
+
+        if self.uav_id == '/uav0':
+            return
+
+        if self.last_leader_armed is None:
+            self.last_leader_armed = self.leader_armed
+        elif self.last_leader_armed and not self.leader_armed:
+            old_leader_z = self.initial_pose_z_Leader
+            self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
+            rospy.logwarn("[%s TrajectoryNode] leader disarmed, reset leader z reference only: %.3f -> %.3f", self.uav_id, old_leader_z, self.initial_pose_z_Leader)
+
+        self.last_leader_armed = self.leader_armed
     
     def set_height(self, time, takeoff_duration, x_stay, y_stay, target_height, Leader_height, Follower_height):
         odom = Odometry()
