@@ -18,6 +18,12 @@ from typing import Optional
 
 
 class Trajectory():
+    MASTER_UAV_ID = '/uav0'
+    DEFAULT_MASTER_HEIGHT_REFERENCE_TOPIC = '/uav0/trajectory/master_height_reference'
+
+    def _master_topic(self, suffix):
+        return self.MASTER_UAV_ID + suffix
+
     def __init__(self):
         rospy.init_node('Trajectory_node',anonymous=True)
         rospy.loginfo("the trajectory node init.")
@@ -38,6 +44,8 @@ class Trajectory():
         self.Lead_lat = 0.0
         self.offset_x = 0.0
         self.offset_y = 0.0
+        self.follow_bias_x = 0.0
+        self.follow_bias_y = 0.0
         self.initial_Lead_yaw = 0.0
         self.Lead_yaw = 0.0
         self.delta_Lead_yaw = 0.0
@@ -55,6 +63,7 @@ class Trajectory():
         self.last_self_armed = None
         self.leader_armed = False
         self.last_leader_armed = None
+        self.master_height_reference_pub = None
         self.rate = rospy.Rate(self.trajectory_rate)
         self.uav_id = rospy.get_param('~self_id','')
         self.role = rospy.get_param('~role','')
@@ -64,9 +73,15 @@ class Trajectory():
         )
 
         if self.role == 'master':
-            self.uav_id = '/uav0'
+            self.uav_id = self.MASTER_UAV_ID
         elif self.role == 'slave':
             self.uav_id = '/' + self.uav_id
+        self.is_master = self.uav_id == self.MASTER_UAV_ID
+
+        self.master_height_reference_topic = rospy.get_param(
+            "~master_height_reference_topic",
+            self.DEFAULT_MASTER_HEIGHT_REFERENCE_TOPIC,
+        )
 
         self.Leader_pose = PoseStamped()
         self.Follower_pose = PoseStamped()
@@ -81,19 +96,31 @@ class Trajectory():
             self._takeoff_param_cb,
             queue_size = 50,
         )
-        if self.uav_id == '/uav0':
-            rospy.Subscriber('/uav0/mavros/state', State, self.self_leader_state_callback)
-            rospy.Subscriber("/uav0/mavros/local_position/pose", PoseStamped, self.Leader_pose_and_att_callback)
-            rospy.Subscriber("/uav0/mavros/local_position/velocity_local", TwistStamped, self.Leader_vel_callback)
+        if self.is_master:
+            rospy.Subscriber(self._master_topic('/mavros/state'), State, self.self_leader_state_callback)
+            rospy.Subscriber(self._master_topic("/mavros/local_position/pose"), PoseStamped, self.Leader_pose_and_att_callback)
+            rospy.Subscriber(self._master_topic("/mavros/local_position/velocity_local"), TwistStamped, self.Leader_vel_callback)
+            self.master_height_reference_pub = rospy.Publisher(
+                self.master_height_reference_topic,
+                Float32,
+                queue_size=1,
+                latch=True,
+            )
         else:
             rospy.Subscriber(self.uav_id + '/mavros/state', State, self.self_state_callback)
-            rospy.Subscriber('/uav0/mavros/state', State, self.Leader_state_callback)
-            rospy.Subscriber("/uav0/mavros/local_position/pose", PoseStamped, self.Leader_pose_and_att_callback)
+            rospy.Subscriber(self._master_topic('/mavros/state'), State, self.Leader_state_callback)
+            rospy.Subscriber(self._master_topic("/mavros/local_position/pose"), PoseStamped, self.Leader_pose_and_att_callback)
             rospy.Subscriber(self.uav_id + "/mavros/local_position/pose", PoseStamped, self.Follower_pose_and_att_callback)
-            rospy.Subscriber("/uav0/mavros/local_position/velocity_local", TwistStamped, self.Leader_vel_callback)
+            rospy.Subscriber(self._master_topic("/mavros/local_position/velocity_local"), TwistStamped, self.Leader_vel_callback)
             rospy.Subscriber(self.uav_id + "/mavros/local_position/velocity_local", TwistStamped, self.Follower_vel_callback)
             rospy.Subscriber(self.uav_id + "/mavros/global_position/global", NavSatFix, self.Follower_global_callback)
-            rospy.Subscriber("/uav0/mavros/global_position/global", NavSatFix, self.Leader_global_callback)
+            rospy.Subscriber(self._master_topic("/mavros/global_position/global"), NavSatFix, self.Leader_global_callback)
+            rospy.Subscriber(
+                self.master_height_reference_topic,
+                Float32,
+                self.master_height_reference_callback,
+                queue_size=1,
+            )
         self.reset_service = rospy.get_param("~trajectory_reset_service", f"{self.uav_id}/trajectory/reset")
         self.reset_srv = rospy.Service(self.reset_service, Trigger, self._reset_cb)
 
@@ -188,13 +215,35 @@ class Trajectory():
         self.Lead_lat = data.latitude
         self.Lead_lon = data.longitude
 
+    def master_height_reference_callback(self, msg: Float32):
+        old_z = self.initial_pose_z_Leader
+        self.initial_pose_z_Leader = float(msg.data)
+
+        rospy.logwarn(
+            "[%s TrajectoryNode] received master height reference: z %.3f -> %.3f",
+            self.uav_id,
+            old_z,
+            self.initial_pose_z_Leader,
+        )
+
     def _reset_cb(self, _req):
         #重置
-        self.takeoff_init_finished = False
         self.takeoff_flag = False
         self.follow_flag = False
-        rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, resetting internal state.", self.uav_id)
+        rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, clearing runtime state.", self.uav_id)
         return TriggerResponse(success=True, message="trajectory reset done")
+
+    def publish_master_height_reference(self, reason):
+        if self.master_height_reference_pub is None:
+            return
+
+        self.master_height_reference_pub.publish(Float32(data=self.initial_pose_z_Leader))
+        rospy.logwarn(
+            "[%s TrajectoryNode] published master height reference reason=%s z=%.3f",
+            self.uav_id,
+            reason,
+            self.initial_pose_z_Leader,
+        )
 
     def reset_leader_reference(self, reason):
         old_x = self.initial_pose_x_Leader
@@ -214,6 +263,8 @@ class Trajectory():
             old_z,
             self.initial_pose_z_Leader,
         )
+        if self.is_master:
+            self.publish_master_height_reference(reason)
 
     def reset_follower_reference(self, reason):
         old_x = self.initial_pose_x
@@ -234,24 +285,66 @@ class Trajectory():
             self.initial_pose_z,
         )
 
+    def reset_follow_horizontal_reference(self, reason):
+        old_offset_x = self.offset_x
+        old_offset_y = self.offset_y
+        old_bias_x = self.follow_bias_x
+        old_bias_y = self.follow_bias_y
+        old_yaw = self.initial_Lead_yaw
+        self.offset_x, self.offset_y = self.latlon_delta_to_meters(
+            self.lon,
+            self.lat,
+            self.Lead_lon,
+            self.Lead_lat,
+        )
+        self.follow_bias_x = (
+            self.Follower_pose.pose.position.x - self.Leader_pose.pose.position.x
+        )
+        self.follow_bias_y = (
+            self.Follower_pose.pose.position.y - self.Leader_pose.pose.position.y
+        )
+        _, _, self.initial_Lead_yaw = self.quaternionToEuler(
+            self.Leader_pose.pose.orientation
+        )
+        rospy.logwarn(
+            "[%s TrajectoryNode] %s, reset follow horizontal reference: offset_x %.3f -> %.3f, offset_y %.3f -> %.3f, bias_x %.3f -> %.3f, bias_y %.3f -> %.3f, initial_yaw %.3f -> %.3f",
+            self.uav_id,
+            reason,
+            old_offset_x,
+            self.offset_x,
+            old_offset_y,
+            self.offset_y,
+            old_bias_x,
+            self.follow_bias_x,
+            old_bias_y,
+            self.follow_bias_y,
+            old_yaw,
+            self.initial_Lead_yaw,
+        )
+
     def refresh_reference_on_arm(self):
         if self.last_self_armed is None:
             self.last_self_armed = self.self_armed
         elif not self.last_self_armed and self.self_armed:
-            if self.uav_id == '/uav0':
+            if self.is_master:
                 self.reset_leader_reference("armed")
             else:
                 self.reset_follower_reference("armed")
+                self.reset_follow_horizontal_reference("armed")
 
         self.last_self_armed = self.self_armed
 
-        if self.uav_id == '/uav0':
+        if self.is_master:
             return
 
         if self.last_leader_armed is None:
             self.last_leader_armed = self.leader_armed
         elif not self.last_leader_armed and self.leader_armed:
-            self.reset_leader_reference("leader armed")
+            self.reset_follow_horizontal_reference("leader armed")
+            rospy.logwarn(
+                "[%s TrajectoryNode] leader armed, using master-published height reference.",
+                self.uav_id,
+            )
 
         self.last_leader_armed = self.leader_armed
     
@@ -284,10 +377,10 @@ class Trajectory():
         return odom
 
     def start(self):
-        if self.uav_id == '/uav0':
-            rospy.wait_for_message('/uav0/mavros/local_position/pose', PoseStamped)
-            rospy.wait_for_message("/uav0/mavros/local_position/velocity_local", TwistStamped)
-            rospy.wait_for_message('/uav0/mavros/state', State)
+        if self.is_master:
+            rospy.wait_for_message(self._master_topic('/mavros/local_position/pose'), PoseStamped)
+            rospy.wait_for_message(self._master_topic("/mavros/local_position/velocity_local"), TwistStamped)
+            rospy.wait_for_message(self._master_topic('/mavros/state'), State)
             rospy.loginfo("Leader trajectory node start.")
 
             while not rospy.is_shutdown():
@@ -336,14 +429,14 @@ class Trajectory():
                 self.rate.sleep()
 
         else:
-            rospy.wait_for_message('/uav0/mavros/local_position/pose', PoseStamped)
+            rospy.wait_for_message(self._master_topic('/mavros/local_position/pose'), PoseStamped)
             rospy.wait_for_message(self.uav_id + '/mavros/local_position/pose', PoseStamped)
-            rospy.wait_for_message("/uav0/mavros/local_position/velocity_local", TwistStamped)
+            rospy.wait_for_message(self._master_topic("/mavros/local_position/velocity_local"), TwistStamped)
             rospy.wait_for_message(self.uav_id + '/mavros/local_position/velocity_local', TwistStamped)
-            rospy.wait_for_message('/uav0/mavros/state', State)
+            rospy.wait_for_message(self._master_topic('/mavros/state'), State)
             rospy.wait_for_message(self.uav_id + '/mavros/state', State)
             rospy.wait_for_message(self.uav_id + "/mavros/global_position/global", NavSatFix)
-            rospy.wait_for_message("/uav0/mavros/global_position/global", NavSatFix)
+            rospy.wait_for_message(self._master_topic("/mavros/global_position/global"), NavSatFix)
             rospy.loginfo("Follower trajectory node start.")
             
             while not rospy.is_shutdown():
@@ -355,8 +448,7 @@ class Trajectory():
                     self.initial_pose_y_Leader = self.Leader_pose.pose.position.y
                     self.initial_pose_z_Leader = self.Leader_pose.pose.position.z
                     if self.first_init:
-                        self.offset_x, self.offset_y = self.latlon_delta_to_meters(self.lon, self.lat, self.Lead_lon, self.Lead_lat)
-                        roll, pitch, self.initial_Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
+                        self.reset_follow_horizontal_reference("initial")
                         self.first_init = False
                     rospy.logerr("[%s TrajectoryNode] Follower initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x, self.initial_pose_y, self.initial_pose_z)
                     self.takeoff_init_finished = True
@@ -386,8 +478,10 @@ class Trajectory():
                     self.follow_flag = True
                     
                 elif self.Leader_current_mode == "POSCTL" and self.follow_flag:
-                    self.target_odom.pose.pose.position.x = self.Leader_pose.pose.position.x + self.offset_x * (cos(self.delta_Lead_yaw) - 1) - self.offset_y * sin(self.delta_Lead_yaw)
-                    self.target_odom.pose.pose.position.y = self.Leader_pose.pose.position.y + self.offset_y * (cos(self.delta_Lead_yaw) - 1) + self.offset_x * sin(self.delta_Lead_yaw)
+                    yaw_correction_x = self.offset_x * (cos(self.delta_Lead_yaw) - 1) - self.offset_y * sin(self.delta_Lead_yaw)
+                    yaw_correction_y = self.offset_y * (cos(self.delta_Lead_yaw) - 1) + self.offset_x * sin(self.delta_Lead_yaw)
+                    self.target_odom.pose.pose.position.x = self.Leader_pose.pose.position.x + self.follow_bias_x + yaw_correction_x
+                    self.target_odom.pose.pose.position.y = self.Leader_pose.pose.position.y + self.follow_bias_y + yaw_correction_y
                     self.target_odom.pose.pose.position.z = self.Leader_relative_z
                     self.target_odom.twist.twist.linear.x = self.Leader_vel.twist.linear.x
                     self.target_odom.twist.twist.linear.y = self.Leader_vel.twist.linear.y
