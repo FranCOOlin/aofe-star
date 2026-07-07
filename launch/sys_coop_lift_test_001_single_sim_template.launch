@@ -143,13 +143,22 @@
 
         <param name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
         <param name="manual_control_timeout" value="1.0"/>
+        <!-- QGC joystick / ManualControl buttons bit mapping for RadioMaster simulation:
+             buttons=2  -> bit1: allow OFFBOARD/ARM
+             buttons=4  -> bit2: takeoff reached, enter next stage
+             buttons=8  -> bit3: CH12-equivalent sync takeoff trigger, rising edge on master
+             buttons=64 -> bit6: land trigger -->
+        <param name="manual_control_offboard_bit" value="1"/>
+        <param name="manual_control_offboard_active_value" value="1"/>
         <param name="manual_control_sb_high_bit" value="7"/>
         <param name="manual_control_sb_low_bit" value="6"/>
-        <param name="manual_control_sa_bit" value="3"/>
+        <param name="manual_control_sa_bit" value="2"/>
         <param name="manual_control_sa_active_value" value="1"/>
-        <param name="manual_control_sd_bit" value="1"/>
+        <param name="manual_control_sd_bit" value="6"/>
         <param name="manual_control_sd_land_value" value="1"/>
-        <param name="manual_control_hook_bit" value="2"/>
+        <param name="manual_control_takeoff_bit" value="3"/>
+        <param name="manual_control_takeoff_active_value" value="1"/>
+        <param name="manual_control_hook_bit" value="-1"/>
         <param name="manual_control_hook_value" value="1"/>
 
         <!-- CH9 三段程序控制开关：低位 idle / 中位 POSCTL / 高位 OFFBOARD -->

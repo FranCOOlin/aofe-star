@@ -503,10 +503,17 @@ class TaskFSMNode:
         ).lower().strip()
 
         # QGC joystick -> MAVLink MANUAL_CONTROL -> MAVROS ManualControl。
-        # SB 三段开关由 buttons 的 bit7/bit6 编码：10 / 01 / 00。
-        # 这里只允许 00 进入 OFFBOARD/ARM 许可。
+        # 仿真可用 manual_control_offboard_bit 单 bit 允许 OFFBOARD/ARM。
+        # 兼容旧配置：若 manual_control_offboard_bit < 0，则继续使用
+        # SB 三段开关 bit7/bit6 编码：10 / 01 / 00，只有 00 允许。
         self.manual_control_timeout = float(
             rospy.get_param("~manual_control_timeout", self.rc_timeout)
+        )
+        self.manual_control_offboard_bit = int(
+            rospy.get_param("~manual_control_offboard_bit", -1)
+        )
+        self.manual_control_offboard_active_value = int(
+            rospy.get_param("~manual_control_offboard_active_value", 1)
         )
         self.manual_control_sb_high_bit = int(
             rospy.get_param(
@@ -533,6 +540,12 @@ class TaskFSMNode:
         )
         self.manual_control_sd_land_value = int(
             rospy.get_param("~manual_control_sd_land_value", 1)
+        )
+        self.manual_control_takeoff_bit = int(
+            rospy.get_param("~manual_control_takeoff_bit", -1)
+        )
+        self.manual_control_takeoff_active_value = int(
+            rospy.get_param("~manual_control_takeoff_active_value", 1)
         )
         self.manual_control_hook_bit = int(
             rospy.get_param("~manual_control_hook_bit", 2)
@@ -1089,9 +1102,11 @@ class TaskFSMNode:
 
     def _update_manual_control_offboard_permission(self, t: float):
         """
-        根据 ManualControl.buttons 中的 SB 开关位刷新 OFFBOARD/ARM 许可。
+        根据 ManualControl.buttons 刷新 OFFBOARD/ARM 许可。
 
-        SB 默认由 bit7/bit6 编码：
+        manual_control_offboard_bit >= 0 时使用单 bit 电平。
+
+        旧 SB fallback 默认由 bit7/bit6 编码：
             10: 不允许
             01: 不允许
             00: 允许 OFFBOARD/ARM
@@ -1105,6 +1120,20 @@ class TaskFSMNode:
                 self.self_id,
             )
             self._set_offboard_permission(False, "manual_control_timeout")
+            return
+
+        if self.manual_control_offboard_bit >= 0:
+            bit_value = self._manual_control_bit(self.manual_control_offboard_bit)
+            new_permission = (
+                bit_value == self.manual_control_offboard_active_value
+            )
+            self._set_offboard_permission(
+                new_permission,
+                "manual_control_offboard_bit{}={}".format(
+                    self.manual_control_offboard_bit,
+                    bit_value,
+                ),
+            )
             return
 
         if self.manual_control_sb_high_bit < 0 or self.manual_control_sb_low_bit < 0:
@@ -1155,7 +1184,6 @@ class TaskFSMNode:
         )
         if bit_index < 0:
             return 0
-        
 
         return (self.manual_control_buttons >> bit_index) & 0x01
 
@@ -1169,7 +1197,8 @@ class TaskFSMNode:
             /<slave_id>/operator/enter_follow service 下发放行命令。
 
         manual_control 策略：
-            SA=1 才允许 TASK_TAKEOFF_RUNNING -> TASK_WAIT_ENTER_FOLLOW_CMD。
+            manual_control_sa_bit=1 才允许
+            TASK_TAKEOFF_RUNNING -> TASK_WAIT_ENTER_FOLLOW_CMD。
 
         rc_in 策略：
             只有 master 读取本机 RCIn。
@@ -1182,7 +1211,7 @@ class TaskFSMNode:
             if not self._manual_control_fresh():
                 rospy.logwarn_throttle(
                     2.0,
-                    "[%s TaskFSM] wait SA switch, but ManualControl is not fresh",
+                    "[%s TaskFSM] wait manual_control advance bit, but ManualControl is not fresh",
                     self.self_id,
                 )
                 return False
@@ -1192,7 +1221,7 @@ class TaskFSMNode:
             if not allowed:
                 rospy.loginfo_throttle(
                     2.0,
-                    "[%s TaskFSM] takeoff reached; waiting SA=%s, current SA=%s",
+                    "[%s TaskFSM] takeoff reached; waiting manual_control advance bit=%s, current=%s",
                     self.self_id,
                     self.manual_control_sa_active_value,
                     sa,
@@ -1207,11 +1236,24 @@ class TaskFSMNode:
 
     def _task_switch_takeoff_requested(self) -> bool:
         """
-        RCIn 策略下，起飞只能由 rc_task_takeoff_channel 的上升沿触发。
+        起飞同步触发由当前输入策略的上升沿触发。
+
+        manual_control 策略：
+            manual_control_takeoff_bit 由 QGC joystick buttons 位触发。
+
+        rc_in 策略：
+            rc_task_takeoff_channel 由 MAVROS RCIn 通道触发。
         """
         active = False
 
-        if self._is_rc_in_strategy():
+        if self._is_manual_control_strategy():
+            active = (
+                self.manual_control_takeoff_bit >= 0
+                and self._manual_control_fresh()
+                and self._manual_control_bit(self.manual_control_takeoff_bit)
+                == self.manual_control_takeoff_active_value
+            )
+        elif self._is_rc_in_strategy():
             active = self._rc_task_switch_takeoff_requested()
 
         requested = active and not self.task_switch_takeoff_active_last
@@ -2252,7 +2294,7 @@ class TaskFSMNode:
             expected_action() 返回 "takeoff"。
 
         master：
-            只有 rc_task_takeoff_channel 上升沿触发后，
+            只有当前输入策略的 takeoff 上升沿触发后，
             才向 sync_gate_node 发起同步起飞 request。
 
         slave：
@@ -2262,11 +2304,19 @@ class TaskFSMNode:
 
         if self.role == "master" and self._task_switch_takeoff_requested():
             self.cmd_takeoff = True
-            rospy.logwarn(
-                "[%s TaskFSM] RC takeoff switch triggered on channel %s",
-                self.self_id,
-                self.rc_task_takeoff_channel,
-            )
+            if self._is_manual_control_strategy():
+                rospy.logwarn(
+                    "[%s TaskFSM] ManualControl takeoff bit %s triggered (buttons=%s)",
+                    self.self_id,
+                    self.manual_control_takeoff_bit,
+                    self.manual_control_buttons,
+                )
+            else:
+                rospy.logwarn(
+                    "[%s TaskFSM] RC takeoff switch triggered on channel %s",
+                    self.self_id,
+                    self.rc_task_takeoff_channel,
+                )
 
         if self.role == "master" and self.cmd_takeoff:
             self._master_request_sync_if_needed(
@@ -3492,8 +3542,16 @@ class TaskFSMNode:
             "rc_task_land_active": self._rc_task_switch_land_requested(),
             "manual_control_buttons": self.manual_control_buttons,
             "manual_control_sb_bits": "{}{}".format(
-                (self.manual_control_buttons >> self.manual_control_sb_high_bit) & 0x01,
-                (self.manual_control_buttons >> self.manual_control_sb_low_bit) & 0x01,
+                self._manual_control_bit(self.manual_control_sb_high_bit),
+                self._manual_control_bit(self.manual_control_sb_low_bit),
+            ),
+            "manual_control_offboard_bit": self.manual_control_offboard_bit,
+            "manual_control_offboard": self._manual_control_bit(
+                self.manual_control_offboard_bit
+            ),
+            "manual_control_takeoff_bit": self.manual_control_takeoff_bit,
+            "manual_control_takeoff": self._manual_control_bit(
+                self.manual_control_takeoff_bit
             ),
             "manual_control_sa": self._manual_control_bit(self.manual_control_sa_bit),
             "manual_control_sd": self._manual_control_bit(self.manual_control_sd_bit),
