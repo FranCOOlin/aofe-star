@@ -5,6 +5,8 @@
 Thumbs.db
 .vscode/
 .idea/
+.codex/
+.codex_tmp/
 *.swp
 *.swo
 
@@ -53,7 +55,16 @@ log/
 *.zip
 *.tar
 *.tar.gz
+*.tar.xz
+*.txz
 *.7z
+
+# =====================
+# Local indexes / generated tools
+# =====================
+.codegraph/
+tools/radiomaster_axis_to_buttons
+tools/radiomaster_axis_to_buttons_v*
 
 # =====================
 # Secrets
