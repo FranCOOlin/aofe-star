@@ -215,6 +215,15 @@
     <!-- 是否启动 controller_nx.py；实飞默认 true，联调可设 false -->
     <arg name="launch_controller" default="true"/>
 
+    <!-- slave 是否叠加 master PX4 期望速度前馈；默认关闭，实飞前先确认 target_local velocity 有效 -->
+    <arg name="enable_master_velocity_feedforward" default="true"/>
+    <arg name="master_velocity_feedforward_topic" default="/uav0/mavros/setpoint_raw/target_local"/>
+    <arg name="master_velocity_feedforward_timeout" default="0.25"/>
+    <arg name="master_velocity_feedforward_gain_xy" default="1.0"/>
+    <arg name="master_velocity_feedforward_gain_z" default="1.0"/>
+    <arg name="slave_cmd_vel_limit_xy" default="6.0"/>
+    <arg name="slave_cmd_vel_limit_z" default="2.0"/>
+
     <!-- 是否启动 MAVROS px4.launch；如果外部已经启动 MAVROS，可设 false -->
     <arg name="launch_mavros" default="true"/>
 
@@ -545,6 +554,13 @@
           output="screen">
         <param name="self_id" value="$(arg self_id)"/>
         <param name="role" value="$(arg role)"/>
+        <param name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
+        <param name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
+        <param name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
+        <param name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
+        <param name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <param name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
+        <param name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </node>
 
 

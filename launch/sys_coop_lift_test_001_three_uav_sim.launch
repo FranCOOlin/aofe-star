@@ -17,6 +17,15 @@
     <arg name="uav2_offboard_arm_request_delay" default="0.8"/>
     <arg name="master_id" default="uav0"/>
 
+    <!-- Master 期望速度前馈参数；传给 slave controller，默认关闭。 -->
+    <arg name="enable_master_velocity_feedforward" default="true"/>
+    <arg name="master_velocity_feedforward_topic" default="/uav0/mavros/setpoint_raw/target_local"/>
+    <arg name="master_velocity_feedforward_timeout" default="0.25"/>
+    <arg name="master_velocity_feedforward_gain_xy" default="1.0"/>
+    <arg name="master_velocity_feedforward_gain_z" default="1.0"/>
+    <arg name="slave_cmd_vel_limit_xy" default="6.0"/>
+    <arg name="slave_cmd_vel_limit_z" default="2.0"/>
+
     <!-- RCIn 通道映射；offboard_permission_source=rc_in 时生效 -->
     <arg name="offboard_switch_channel" default="9"/>
     <arg name="offboard_switch_pos_threshold" default="1300"/>
@@ -80,6 +89,13 @@
         <arg name="rc_emergency_hold_direction" value="$(arg rc_emergency_hold_direction)"/>
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
+        <arg name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
+        <arg name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
+        <arg name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
+        <arg name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
+        <arg name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <arg name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
+        <arg name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </include>
 
     <!-- uav1: slave，仿真中也启动轨迹/控制链路，保证 OFFBOARD 前有 setpoint。 -->
@@ -114,6 +130,13 @@
         <arg name="rc_emergency_hold_direction" value="$(arg rc_emergency_hold_direction)"/>
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
+        <arg name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
+        <arg name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
+        <arg name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
+        <arg name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
+        <arg name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <arg name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
+        <arg name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </include>
 
     <!-- uav2: slave，仿真中也启动轨迹/控制链路，保证 OFFBOARD 前有 setpoint。 -->
@@ -148,5 +171,12 @@
         <arg name="rc_emergency_hold_direction" value="$(arg rc_emergency_hold_direction)"/>
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
+        <arg name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
+        <arg name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
+        <arg name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
+        <arg name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
+        <arg name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <arg name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
+        <arg name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </include>
 </launch>
