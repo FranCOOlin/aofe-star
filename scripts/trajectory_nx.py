@@ -4,13 +4,24 @@ import rospy
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String, Float32
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from mavros_msgs.msg import State
+from mavros_msgs.msg import PositionTarget, State
 from sensor_msgs.msg import NavSatFix, Range
 from std_srvs.srv import Trigger, TriggerResponse
 from aofe_star.srv import JsonPayload, JsonPayloadResponse
 from math import *
 import json
 from typing import Optional
+
+
+def get_bool_param(name, default=False):
+    value = rospy.get_param(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ['true', '1', 'yes', 'on']
+    return bool(value)
+
+
 # 当收到起飞时间戳(通过geometry_msgs/TwistStamped中的header.stamp,话题:self.uav_id + '/takeoff_time')
 # 即得到起飞标志位，发送带有反馈的预设轨迹（位置+速度）。接收主机高度。接收自身高度,接收自身水平位置。发送格式:nav_msgs/Odometry,话题:self.uav_id + '/trajectory' 
 # 接收格式:PoseStamped,话题:self.uav_id + '/mavros/local_position/pose'
@@ -79,6 +90,15 @@ class Trajectory():
         self.initial_Lead_yaw = 0.0
         self.Lead_yaw = 0.0
         self.delta_Lead_yaw = 0.0
+        self.master_setpoint_vel_x = 0.0
+        self.master_setpoint_vel_y = 0.0
+        self.master_setpoint_vel_z = 0.0
+        self.master_setpoint_time = 0.0
+        self.master_setpoint_yaw_rate = 0.0
+        self.master_setpoint_yaw_rate_raw = 0.0
+        self.master_setpoint_yaw_rate_time = 0.0
+        self.master_setpoint_yaw_rate_filter_time = None
+        self.master_setpoint_yaw_rate_valid = False
         self.Follow_yaw = 0.0
         self.initial_pose_x = 0.0
         self.initial_pose_y = 0.0
@@ -139,6 +159,26 @@ class Trajectory():
         self.takeoff_reference_reset_delay = float(
             rospy.get_param("~takeoff_reference_reset_delay", 1.0)
         )
+        self.enable_follow_yaw_rate_feedforward = get_bool_param(
+            "~enable_follow_yaw_rate_feedforward",
+            True,
+        )
+        self.follow_yaw_rate_feedforward_gain = float(
+            rospy.get_param("~follow_yaw_rate_feedforward_gain", 1.0)
+        )
+        self.follow_yaw_rate_lpf_cutoff_hz = float(
+            rospy.get_param("~follow_yaw_rate_lpf_cutoff_hz", 3.0)
+        )
+        self.follow_yaw_rate_max_dt = float(
+            rospy.get_param("~follow_yaw_rate_max_dt", 0.2)
+        )
+        self.master_setpoint_topic = rospy.get_param(
+            "~master_setpoint_topic",
+            self._master_topic("/mavros/setpoint_raw/target_local"),
+        )
+        self.master_setpoint_timeout = float(
+            rospy.get_param("~master_setpoint_timeout", 0.3)
+        )
 
         self.Leader_pose = PoseStamped()
         self.Follower_pose = PoseStamped()
@@ -170,6 +210,7 @@ class Trajectory():
             rospy.Subscriber(self._master_topic("/mavros/local_position/pose"), PoseStamped, self.Leader_pose_and_att_callback)
             rospy.Subscriber(self.uav_id + "/mavros/local_position/pose", PoseStamped, self.Follower_pose_and_att_callback)
             rospy.Subscriber(self._master_topic("/mavros/local_position/velocity_local"), TwistStamped, self.Leader_vel_callback)
+            rospy.Subscriber(self.master_setpoint_topic, PositionTarget, self.master_setpoint_callback)
             rospy.Subscriber(self.uav_id + "/mavros/local_position/velocity_local", TwistStamped, self.Follower_vel_callback)
             rospy.Subscriber(self.uav_id + "/mavros/global_position/global", NavSatFix, self.Follower_global_callback)
             rospy.Subscriber(self._master_topic("/mavros/global_position/global"), NavSatFix, self.Leader_global_callback)
@@ -208,6 +249,145 @@ class Trajectory():
         pitch = asin(2 * (q.w * q.y - q.z * q.x))
         yaw   = atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         return roll, pitch, yaw #弧度
+
+    def wrap_angle(self, angle):
+        return atan2(sin(angle), cos(angle))
+
+    def _filter_master_setpoint_yaw_rate(self, yaw_rate, now):
+        last_time = self.master_setpoint_yaw_rate_filter_time
+        self.master_setpoint_yaw_rate_raw = yaw_rate
+        if last_time is None or self.follow_yaw_rate_lpf_cutoff_hz <= 0.0:
+            self.master_setpoint_yaw_rate = yaw_rate
+        else:
+            dt = now - last_time
+            if dt < 1e-4 or dt > self.follow_yaw_rate_max_dt:
+                self.master_setpoint_yaw_rate = yaw_rate
+            else:
+                tau = 1.0 / (2.0 * pi * self.follow_yaw_rate_lpf_cutoff_hz)
+                alpha = dt / (tau + dt)
+                self.master_setpoint_yaw_rate += (
+                    alpha * (yaw_rate - self.master_setpoint_yaw_rate)
+                )
+
+        self.master_setpoint_yaw_rate_filter_time = now
+        self.master_setpoint_yaw_rate_time = now
+        self.master_setpoint_yaw_rate_valid = True
+
+    def master_setpoint_callback(self, data):
+        now = rospy.Time.now().to_sec()
+
+        vx_valid = (
+            not bool(data.type_mask & PositionTarget.IGNORE_VX)
+            and isfinite(data.velocity.x)
+        )
+        vy_valid = (
+            not bool(data.type_mask & PositionTarget.IGNORE_VY)
+            and isfinite(data.velocity.y)
+        )
+        vz_valid = (
+            not bool(data.type_mask & PositionTarget.IGNORE_VZ)
+            and isfinite(data.velocity.z)
+        )
+
+        self.master_setpoint_vel_x = data.velocity.x if vx_valid else 0.0
+        self.master_setpoint_vel_y = data.velocity.y if vy_valid else 0.0
+        self.master_setpoint_vel_z = data.velocity.z if vz_valid else 0.0
+        self.master_setpoint_time = now
+
+        yaw_rate_valid = (
+            not bool(data.type_mask & PositionTarget.IGNORE_YAW_RATE)
+            and isfinite(data.yaw_rate)
+        )
+        if yaw_rate_valid:
+            self._filter_master_setpoint_yaw_rate(data.yaw_rate, now)
+        else:
+            self.master_setpoint_yaw_rate_raw = 0.0
+            self.master_setpoint_yaw_rate = 0.0
+            self.master_setpoint_yaw_rate_time = now
+            self.master_setpoint_yaw_rate_filter_time = now
+            self.master_setpoint_yaw_rate_valid = False
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] master setpoint yaw_rate ignored or invalid, disable yaw-rate feedforward",
+                self.uav_id,
+            )
+
+        if not (vx_valid and vy_valid and vz_valid):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] master setpoint velocity partially ignored: vx=%s vy=%s vz=%s",
+                self.uav_id,
+                str(vx_valid),
+                str(vy_valid),
+                str(vz_valid),
+            )
+
+    def reset_delta_yaw_reference(self):
+        self.delta_Lead_yaw = 0.0
+
+    def master_setpoint_velocity_for_follow(self):
+        if self.master_setpoint_time <= 0.0:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] waiting master setpoint topic=%s",
+                self.uav_id,
+                self.master_setpoint_topic,
+            )
+            return 0.0, 0.0, 0.0
+
+        if rospy.Time.now().to_sec() - self.master_setpoint_time > self.master_setpoint_timeout:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] master setpoint stale, disable setpoint velocity feedforward",
+                self.uav_id,
+            )
+            return 0.0, 0.0, 0.0
+
+        return (
+            self.master_setpoint_vel_x,
+            self.master_setpoint_vel_y,
+            self.master_setpoint_vel_z,
+        )
+
+    def master_setpoint_yaw_rate_for_follow(self):
+        if not self.enable_follow_yaw_rate_feedforward:
+            return 0.0
+
+        if self.master_setpoint_yaw_rate_time <= 0.0:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] waiting master setpoint yaw_rate topic=%s",
+                self.uav_id,
+                self.master_setpoint_topic,
+            )
+            return 0.0
+
+        if not self.master_setpoint_yaw_rate_valid:
+            return 0.0
+
+        if (
+            rospy.Time.now().to_sec() - self.master_setpoint_yaw_rate_time
+            > self.master_setpoint_timeout
+        ):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] master setpoint yaw_rate stale, disable yaw-rate feedforward",
+                self.uav_id,
+            )
+            return 0.0
+
+        return self.follow_yaw_rate_feedforward_gain * self.master_setpoint_yaw_rate
+
+    def follow_target_velocity(self):
+        vx, vy, vz = self.master_setpoint_velocity_for_follow()
+
+        c = cos(self.delta_Lead_yaw)
+        s = sin(self.delta_Lead_yaw)
+        omega = self.master_setpoint_yaw_rate_for_follow()
+
+        yaw_ff_x = omega * (-self.offset_x * s - self.offset_y * c)
+        yaw_ff_y = omega * (self.offset_x * c - self.offset_y * s)
+        return vx + yaw_ff_x, vy + yaw_ff_y, vz
 
     def safe_json_loads(self, text: str) -> Optional[dict]:
         """
@@ -505,6 +685,7 @@ class Trajectory():
         _, _, self.initial_Lead_yaw = self.quaternionToEuler(
             self.Leader_pose.pose.orientation
         )
+        self.reset_delta_yaw_reference()
         rospy.logwarn(
             "[%s TrajectoryNode] %s, reset follow horizontal reference: offset_x %.3f -> %.3f, offset_y %.3f -> %.3f, bias_x %.3f -> %.3f, bias_y %.3f -> %.3f, initial_yaw %.3f -> %.3f",
             self.uav_id,
@@ -860,7 +1041,7 @@ class Trajectory():
                 self.refresh_reference_on_arm()
                 self.update_relative_heights()
                 roll, pitch, self.Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
-                self.delta_Lead_yaw = self.Lead_yaw - self.initial_Lead_yaw
+                self.delta_Lead_yaw = self.wrap_angle(self.Lead_yaw - self.initial_Lead_yaw)
                 self.testpub.publish(self.delta_Lead_yaw)
                 self.Follow_yaw = self.Lead_yaw
                 self.target_yaw_pub.publish(self.Follow_yaw)
@@ -893,9 +1074,10 @@ class Trajectory():
                     self.target_odom.pose.pose.position.x = self.Leader_pose.pose.position.x + self.follow_bias_x + yaw_correction_x
                     self.target_odom.pose.pose.position.y = self.Leader_pose.pose.position.y + self.follow_bias_y + yaw_correction_y
                     self.target_odom.pose.pose.position.z = self.Leader_relative_z
-                    self.target_odom.twist.twist.linear.x = self.Leader_vel.twist.linear.x
-                    self.target_odom.twist.twist.linear.y = self.Leader_vel.twist.linear.y
-                    self.target_odom.twist.twist.linear.z = self.Leader_vel.twist.linear.z
+                    follow_vx, follow_vy, follow_vz = self.follow_target_velocity()
+                    self.target_odom.twist.twist.linear.x = follow_vx
+                    self.target_odom.twist.twist.linear.y = follow_vy
+                    self.target_odom.twist.twist.linear.z = follow_vz
                     self.target_odom.header.stamp = rospy.Time.now()
                     self.target_pose_and_velocity_pub.publish(self.target_odom)
 

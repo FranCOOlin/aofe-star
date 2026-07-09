@@ -1,8 +1,10 @@
 #!/usr/bin/python3
 #coding=utf-8
+import json
+
 import rospy
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from geometry_msgs.msg import Twist
 from mavros_msgs.msg import PositionTarget, State
 import numpy as np
@@ -144,30 +146,31 @@ class Control_loop():
         self.role = rospy.get_param('~role','')
 
         # ============================================================
-        # Master velocity feedforward 参数。
+        # Follow velocity feedforward 参数。
         #
         # 设计约定：
         #   1. 只在 slave 控制器中使用；
-        #   2. 前馈源是 master MAVROS setpoint_raw/target_local；
-        #   3. MAVROS 发布到 ROS topic 后，velocity 按 ROS ENU 语义表达；
-        #   4. 前馈默认关闭，实飞前先确认 target_local 中 velocity 有效。
+        #   2. 前馈源是 trajectory_nx.py 发布的 trajectory.twist；
+        #   3. trajectory_nx.py 在 follow 模式中已把 master 速度和 delta_yaw
+        #      旋转修正项合成到期望速度里；
+        #   4. 前馈只在 mission state 为 TASK_FOLLOW_MASTER 时叠加。
         # ============================================================
         self.enable_master_velocity_feedforward = get_bool_param(
             '~enable_master_velocity_feedforward',
             False,
-        )
-        self.master_velocity_feedforward_topic = rospy.get_param(
-            '~master_velocity_feedforward_topic',
-            '/uav0/mavros/setpoint_raw/target_local',
-        )
-        self.master_velocity_feedforward_timeout = float(
-            rospy.get_param('~master_velocity_feedforward_timeout', 0.25)
         )
         self.master_velocity_feedforward_gain_xy = float(
             rospy.get_param('~master_velocity_feedforward_gain_xy', 1.0)
         )
         self.master_velocity_feedforward_gain_z = float(
             rospy.get_param('~master_velocity_feedforward_gain_z', 0.0)
+        )
+        self.feedforward_follow_task_state = rospy.get_param(
+            '~feedforward_follow_task_state',
+            'TASK_FOLLOW_MASTER',
+        )
+        self.feedforward_mission_state_timeout = float(
+            rospy.get_param('~feedforward_mission_state_timeout', 0.5)
         )
 
         # 最终限幅只在实际叠加前馈时启用；无前馈/超时/ignore 时保持原 PID 输出。
@@ -182,6 +185,10 @@ class Control_loop():
             self.uav_id = '/uav0'
         elif self.role == 'slave':
             self.uav_id = '/' + self.uav_id
+        self.mission_state_topic = rospy.get_param(
+            '~mission_state_topic',
+            self.uav_id + '/mission/state',
+        )
 
         self.traj_xy = np.zeros(2)
         self.traj_z = 0
@@ -202,29 +209,32 @@ class Control_loop():
         self.state_ready = False
         self.yawd_ready = False
 
-        # 缓存最近一次 master 前馈速度。
-        # master_ff_last_recv_time 为 None 表示还没有收到过有效 topic 回调。
-        self.master_ff_vel_xy = np.zeros(2)
-        self.master_ff_vel_z = 0.0
-        self.master_ff_last_recv_time = None
+        self.task_state = ''
+        self.task_state_last_recv_time = None
 
         rospy.Subscriber(self.uav_id + '/trajectory', Odometry, self.traj_callback)
         rospy.Subscriber(self.uav_id + '/state', Odometry, self.state_callback)
         rospy.Subscriber(self.uav_id + '/yawd', Float32, self.yawd_callback)
         rospy.Subscriber('/uav0/mavros/state', State, self.Leader_state_callback)
 
-        # 只有 slave 且显式打开开关时才订阅 master 前馈，避免默认行为变化。
-        if self.role == 'slave' and self.enable_master_velocity_feedforward:
+        feedforward_enabled = (
+            self.role == 'slave'
+            and self.enable_master_velocity_feedforward
+        )
+
+        if feedforward_enabled:
             rospy.Subscriber(
-                self.master_velocity_feedforward_topic,
-                PositionTarget,
-                self.master_velocity_feedforward_callback,
+                self.mission_state_topic,
+                String,
+                self.mission_state_callback,
             )
+
+        if self.role == 'slave' and self.enable_master_velocity_feedforward:
             rospy.logwarn(
-                "[%s Controller] master velocity feedforward enabled: topic=%s timeout=%.3fs gain_xy=%.3f gain_z=%.3f",
+                "[%s Controller] trajectory velocity feedforward enabled only in %s: source=%s gain_xy=%.3f gain_z=%.3f",
                 self.uav_id,
-                self.master_velocity_feedforward_topic,
-                self.master_velocity_feedforward_timeout,
+                self.feedforward_follow_task_state,
+                self.uav_id + '/trajectory.twist',
                 self.master_velocity_feedforward_gain_xy,
                 self.master_velocity_feedforward_gain_z,
             )
@@ -252,55 +262,59 @@ class Control_loop():
     def Leader_state_callback(self, data):
         self.Leader_mode = data.mode
 
-    def master_velocity_feedforward_callback(self, data):
-        """
-        缓存 master 的 PX4 期望速度前馈。
+    def mission_state_callback(self, data):
+        try:
+            payload = json.loads(data.data)
+        except Exception as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s Controller] ignore invalid mission state json: %s",
+                self.uav_id,
+                str(exc),
+            )
+            return
 
-        data 来自 /uav0/mavros/setpoint_raw/target_local，类型为 PositionTarget。
-        PX4/MAVLink 原始消息是 POSITION_TARGET_LOCAL_NED；MAVROS 在发布 ROS topic
-        时已经把 position/velocity/acceleration 转为 ENU 数值。这里不再根据
-        coordinate_frame 做 ENU/NED 转换，只按 type_mask 判断各轴 velocity 是否有效。
-        """
-        # POSITION_TARGET_TYPEMASK 中 IGNORE_V* 置位代表该轴速度目标无效。
-        # 无效或非有限数的轴不参与前馈，直接置 0。
-        ff_x_valid = (
-            not bool(data.type_mask & PositionTarget.IGNORE_VX)
-            and np.isfinite(data.velocity.x)
-        )
-        ff_y_valid = (
-            not bool(data.type_mask & PositionTarget.IGNORE_VY)
-            and np.isfinite(data.velocity.y)
-        )
-        ff_z_valid = (
-            not bool(data.type_mask & PositionTarget.IGNORE_VZ)
-            and np.isfinite(data.velocity.z)
-        )
+        self.task_state = str(payload.get('task_state', ''))
+        self.task_state_last_recv_time = rospy.Time.now().to_sec()
 
-        # 按轴缓存速度前馈，允许 x/y/z 部分有效。
-        self.master_ff_vel_xy = np.array([
-            data.velocity.x if ff_x_valid else 0.0,
-            data.velocity.y if ff_y_valid else 0.0,
-        ])
-        self.master_ff_vel_z = data.velocity.z if ff_z_valid else 0.0
-        self.master_ff_last_recv_time = rospy.Time.now().to_sec()
+    def follow_feedforward_active(self):
+        if self.role != 'slave':
+            return False
+
+        if self.task_state != self.feedforward_follow_task_state:
+            return False
+
+        if self.task_state_last_recv_time is None:
+            return False
+
+        if (
+            rospy.Time.now().to_sec() - self.task_state_last_recv_time
+            > self.feedforward_mission_state_timeout
+        ):
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s Controller] mission state stale, disable trajectory velocity feedforward",
+                self.uav_id,
+            )
+            return False
+
+        return True
 
     def get_master_velocity_feedforward(self):
         """
-        返回当前可用的 master 速度前馈。
+        返回当前可用的 follow 期望速度前馈。
 
-        返回值始终是 ROS ENU 语义的 (xy, z)。当前馈开关关闭、尚未收到消息、
-        或消息超时时，返回 0，使 slave 完全退回原 PID 控制。
+        trajectory_nx.py 在 follow 模式里已经把 master 速度和 offset/delta_yaw
+        旋转项求导后写入 trajectory.twist。控制器只在 follow mission state 下
+        叠加这个速度，其他阶段保持原 PID 行为。
         """
         if not self.enable_master_velocity_feedforward:
             return np.zeros(2), 0.0
 
-        if self.master_ff_last_recv_time is None:
+        if not self.follow_feedforward_active():
             return np.zeros(2), 0.0
 
-        if rospy.Time.now().to_sec() - self.master_ff_last_recv_time > self.master_velocity_feedforward_timeout:
-            return np.zeros(2), 0.0
-
-        return self.master_ff_vel_xy.copy(), self.master_ff_vel_z
+        return self.traj_vel_xy.copy(), self.traj_vel_z
 
     def limit_horizontal_velocity(self, vel_xy):
         """
@@ -344,8 +358,9 @@ class Control_loop():
                         self.Control_to_vel.linear.z = PID_height.output
                     self.setpoint_velocity_cmd_vel_pub.publish(self.Control_to_vel)
                 elif self.role == 'slave' and self.yawd_ready: #手动转换坐标系
-                    # slave 原始输出是位置/速度误差 PID；前馈是 master PX4 在 POSCTL/POSITION
-                    # 下给出的期望速度。两者都按本控制器内部的 local ENU 数值叠加。
+                    # slave 原始输出是位置/速度误差 PID；前馈直接取 trajectory_nx.py
+                    # 发布的期望速度。follow 时该速度已包含 master 速度和
+                    # offset/delta_yaw 旋转修正项的导数。
                     ff_vel_xy, ff_vel_z = self.get_master_velocity_feedforward()
                     ff_cmd_xy = self.master_velocity_feedforward_gain_xy * ff_vel_xy
                     ff_cmd_z = self.master_velocity_feedforward_gain_z * ff_vel_z

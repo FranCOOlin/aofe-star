@@ -22,12 +22,16 @@
     <arg name="uav2_offboard_arm_request_delay" default="0.8"/>
     <arg name="master_id" default="uav0"/>
 
-    <!-- Master 期望速度前馈参数；传给 slave controller，默认关闭。 -->
+    <!-- Follow 速度前馈参数；trajectory 生成期望速度，slave controller 只在 follow 状态叠加。 -->
     <arg name="enable_master_velocity_feedforward" default="true"/>
-    <arg name="master_velocity_feedforward_topic" default="/uav0/mavros/setpoint_raw/target_local"/>
-    <arg name="master_velocity_feedforward_timeout" default="0.25"/>
     <arg name="master_velocity_feedforward_gain_xy" default="1.0"/>
     <arg name="master_velocity_feedforward_gain_z" default="1.0"/>
+    <arg name="enable_master_yaw_rate_feedforward" default="true"/>
+    <arg name="master_yaw_rate_feedforward_gain" default="1.0"/>
+    <arg name="master_setpoint_topic" default="/uav0/mavros/setpoint_raw/target_local"/>
+    <arg name="master_setpoint_timeout" default="0.3"/>
+    <arg name="follow_yaw_rate_lpf_cutoff_hz" default="3.0"/>
+    <arg name="follow_yaw_rate_max_dt" default="0.2"/>
     <arg name="slave_cmd_vel_limit_xy" default="6.0"/>
     <arg name="slave_cmd_vel_limit_z" default="2.0"/>
 
@@ -100,10 +104,14 @@
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
         <arg name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
-        <arg name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
-        <arg name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
         <arg name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
         <arg name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <arg name="enable_master_yaw_rate_feedforward" value="$(arg enable_master_yaw_rate_feedforward)"/>
+        <arg name="master_yaw_rate_feedforward_gain" value="$(arg master_yaw_rate_feedforward_gain)"/>
+        <arg name="master_setpoint_topic" value="$(arg master_setpoint_topic)"/>
+        <arg name="master_setpoint_timeout" value="$(arg master_setpoint_timeout)"/>
+        <arg name="follow_yaw_rate_lpf_cutoff_hz" value="$(arg follow_yaw_rate_lpf_cutoff_hz)"/>
+        <arg name="follow_yaw_rate_max_dt" value="$(arg follow_yaw_rate_max_dt)"/>
         <arg name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
         <arg name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </include>
@@ -146,10 +154,14 @@
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
         <arg name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
-        <arg name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
-        <arg name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
         <arg name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
         <arg name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <arg name="enable_master_yaw_rate_feedforward" value="$(arg enable_master_yaw_rate_feedforward)"/>
+        <arg name="master_yaw_rate_feedforward_gain" value="$(arg master_yaw_rate_feedforward_gain)"/>
+        <arg name="master_setpoint_topic" value="$(arg master_setpoint_topic)"/>
+        <arg name="master_setpoint_timeout" value="$(arg master_setpoint_timeout)"/>
+        <arg name="follow_yaw_rate_lpf_cutoff_hz" value="$(arg follow_yaw_rate_lpf_cutoff_hz)"/>
+        <arg name="follow_yaw_rate_max_dt" value="$(arg follow_yaw_rate_max_dt)"/>
         <arg name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
         <arg name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </include>
@@ -192,10 +204,14 @@
         <arg name="launch_trajectory" value="true"/>
         <arg name="launch_controller" value="true"/>
         <arg name="enable_master_velocity_feedforward" value="$(arg enable_master_velocity_feedforward)"/>
-        <arg name="master_velocity_feedforward_topic" value="$(arg master_velocity_feedforward_topic)"/>
-        <arg name="master_velocity_feedforward_timeout" value="$(arg master_velocity_feedforward_timeout)"/>
         <arg name="master_velocity_feedforward_gain_xy" value="$(arg master_velocity_feedforward_gain_xy)"/>
         <arg name="master_velocity_feedforward_gain_z" value="$(arg master_velocity_feedforward_gain_z)"/>
+        <arg name="enable_master_yaw_rate_feedforward" value="$(arg enable_master_yaw_rate_feedforward)"/>
+        <arg name="master_yaw_rate_feedforward_gain" value="$(arg master_yaw_rate_feedforward_gain)"/>
+        <arg name="master_setpoint_topic" value="$(arg master_setpoint_topic)"/>
+        <arg name="master_setpoint_timeout" value="$(arg master_setpoint_timeout)"/>
+        <arg name="follow_yaw_rate_lpf_cutoff_hz" value="$(arg follow_yaw_rate_lpf_cutoff_hz)"/>
+        <arg name="follow_yaw_rate_max_dt" value="$(arg follow_yaw_rate_max_dt)"/>
         <arg name="slave_cmd_vel_limit_xy" value="$(arg slave_cmd_vel_limit_xy)"/>
         <arg name="slave_cmd_vel_limit_z" value="$(arg slave_cmd_vel_limit_z)"/>
     </include>
