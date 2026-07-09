@@ -15,12 +15,24 @@
 
     <model name="high_distance_sensor_test_platform">
       <static>true</static>
-      <pose>18 0 1.0 0 0 0</pose>
+      <!--
+        Platform top height is 2.0 m.
+        Keep the collision as a thin top deck so downward rangefinder rays hit
+        the platform surface instead of starting inside a thick solid box.
+        To change height H:
+          - deck pose z = H - 0.02
+          - deck size z = 0.04
+          - visual pose z = H / 2
+          - visual size z = H
+          - launch spawn_z ~= H + 0.12
+      -->
+      <pose>0 0 0 0 0 0</pose>
       <link name="link">
-        <collision name="collision">
+        <collision name="top_deck_collision">
+          <pose>0 0 1.98 0 0 0</pose>
           <geometry>
             <box>
-              <size>12 12 2</size>
+              <size>48 48 0.04</size>
             </box>
           </geometry>
           <surface>
@@ -40,9 +52,10 @@
         </collision>
 
         <visual name="visual">
+          <pose>0 0 1.0 0 0 0</pose>
           <geometry>
             <box>
-              <size>12 12 2</size>
+              <size>48 48 2</size>
             </box>
           </geometry>
           <material>

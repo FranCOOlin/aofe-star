@@ -7,6 +7,7 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
 from sensor_msgs.msg import NavSatFix, Range
 from std_srvs.srv import Trigger, TriggerResponse
+from aofe_star.srv import JsonPayload, JsonPayloadResponse
 from math import *
 import json
 from typing import Optional
@@ -37,9 +38,16 @@ class Trajectory():
         self.takeoff_flag = False
         self.takeoff_init_finished = False
         self.follow_flag = False
+        self.landing_flag = False
         self.first_init = True
         self.post_takeoff_horizontal_reset_done = False
         self.takeoff_start_time = None
+        self.landing_start_time = None
+        self.landing_duration = 0.0
+        self.landing_sync_id = ""
+        self.landing_start_x = 0.0
+        self.landing_start_y = 0.0
+        self.landing_start_z = 0.0
         self.action = None
         self.post_takeoff_horizontal_reset_delay = float(
             rospy.get_param("~post_takeoff_horizontal_reset_delay", 1.0)
@@ -47,6 +55,18 @@ class Trajectory():
         self.takeoff_duration = 5.0 # 起飞持续时间
         self.adjust_kp = 0.5 # 反馈参数
         self.target_height = 4.0 # 期望高度
+        self.landing_target_height = float(
+            rospy.get_param("~landing_target_height", -0.5)
+        )
+        self.landing_descent_speed = float(
+            rospy.get_param("~landing_descent_speed", 0.35)
+        )
+        self.landing_min_duration = float(
+            rospy.get_param("~landing_min_duration", 5.0)
+        )
+        self.landing_max_duration = float(
+            rospy.get_param("~landing_max_duration", 30.0)
+        )
         self.trajectory_rate = 80
         self.lon = 0.0
         self.lat = 0.0
@@ -163,6 +183,15 @@ class Trajectory():
             )
         self.reset_service = rospy.get_param("~trajectory_reset_service", f"{self.uav_id}/trajectory/reset")
         self.reset_srv = rospy.Service(self.reset_service, Trigger, self._reset_cb)
+        self.transfer_to_landing_service = rospy.get_param(
+            "~transfer_to_landing_service",
+            f"{self.uav_id}/transfer_to_landing",
+        )
+        self.transfer_to_landing_srv = rospy.Service(
+            self.transfer_to_landing_service,
+            JsonPayload,
+            self._transfer_to_landing_cb,
+        )
 
         self.target_pose_and_velocity_pub = rospy.Publisher(self.uav_id + '/trajectory', Odometry, queue_size=1)
         self.pose_and_velocity_pub = rospy.Publisher(self.uav_id + '/state', Odometry, queue_size=1)
@@ -279,6 +308,22 @@ class Trajectory():
         self.Follower_laser_height = height
         self.Follower_laser_height_time = rospy.Time.now().to_sec()
 
+    def _self_pose(self):
+        return self.Leader_pose if self.is_master else self.Follower_pose
+
+    def _self_velocity(self):
+        return self.Leader_vel if self.is_master else self.Follower_vel
+
+    def _get_self_laser_height(self, warn=True):
+        if self.is_master:
+            return self._get_leader_laser_height(warn)
+        return self._get_follower_laser_height(warn)
+
+    def _latest_self_laser_height(self):
+        if self.is_master:
+            return self.Leader_laser_height
+        return self.Follower_laser_height
+
     def Follower_global_callback(self, data):
         self.lat = data.latitude
         self.lon = data.longitude
@@ -301,12 +346,91 @@ class Trajectory():
     def _reset_cb(self, _req):
         #重置
         self.takeoff_flag = False
+        self.landing_flag = False
         self.follow_flag = False
         self.active_takeoff_t0 = None
+        self.landing_start_time = None
+        self.landing_duration = 0.0
+        self.landing_sync_id = ""
         self.takeoff_horizontal_reference_reset_done = False
         self.takeoff_z_reference_reset_done = False
         rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, clearing runtime state.", self.uav_id)
         return TriggerResponse(success=True, message="trajectory reset done")
+
+    def _landing_duration_from_height(self, start_height):
+        descent_distance = max(0.0, start_height - self.landing_target_height)
+        min_duration = max(0.1, self.landing_min_duration)
+        max_duration = max(min_duration, self.landing_max_duration)
+        if self.landing_descent_speed <= 1e-3:
+            raw_duration = min_duration
+        else:
+            raw_duration = descent_distance / self.landing_descent_speed
+        return min(
+            max(raw_duration, min_duration),
+            max_duration,
+        )
+
+    def _transfer_to_landing_cb(self, req):
+        data = self.safe_json_loads(req.payload)
+        if data is None:
+            return JsonPayloadResponse(False, "invalid_json", "")
+
+        action = str(data.get("action", ""))
+        if action and action != "land":
+            return JsonPayloadResponse(False, f"unexpected_action:{action}", "")
+
+        try:
+            t0 = float(data.get("t0", 0.0))
+        except Exception:
+            return JsonPayloadResponse(False, "invalid_t0", "")
+
+        if t0 <= 0.0:
+            return JsonPayloadResponse(False, "invalid_t0", "")
+
+        laser_height = self._get_self_laser_height(warn=True)
+        if laser_height is None:
+            return JsonPayloadResponse(False, "no_fresh_laser_height", "")
+
+        pose = self._self_pose()
+        self.landing_start_x = pose.pose.position.x
+        self.landing_start_y = pose.pose.position.y
+        self.landing_start_z = laser_height
+        self.landing_start_time = t0
+        self.landing_duration = self._landing_duration_from_height(laser_height)
+        self.landing_sync_id = str(data.get("sync_id", ""))
+        self.landing_flag = True
+        self.takeoff_flag = False
+
+        response_data = {
+            "src": self.uav_id.strip("/"),
+            "stamp": rospy.Time.now().to_sec(),
+            "action": "land",
+            "sync_id": self.landing_sync_id,
+            "t0": self.landing_start_time,
+            "duration": self.landing_duration,
+            "start_x": self.landing_start_x,
+            "start_y": self.landing_start_y,
+            "start_height": self.landing_start_z,
+            "target_height": self.landing_target_height,
+        }
+
+        rospy.loginfo(
+            "[%s TrajectoryNode] transfer_to_landing accepted sync_id=%s t0=%.3f duration=%.3f start=(%.3f, %.3f, %.3f) target_z=%.3f",
+            self.uav_id,
+            self.landing_sync_id,
+            self.landing_start_time,
+            self.landing_duration,
+            self.landing_start_x,
+            self.landing_start_y,
+            self.landing_start_z,
+            self.landing_target_height,
+        )
+
+        return JsonPayloadResponse(
+            True,
+            "accepted",
+            json.dumps(response_data, ensure_ascii=False, separators=(",", ":")),
+        )
 
     def publish_master_height_reference(self, reason):
         if self.master_height_reference_pub is None:
@@ -587,6 +711,69 @@ class Trajectory():
             odom.pose.pose.position.z += self.adjust_kp * (Leader_height - Follower_height)
         return odom
 
+    def set_landing_height(self, time, landing_duration, x_stay, y_stay, start_height, target_height):
+        odom = Odometry()
+        landing_duration = max(landing_duration, 0.1)
+        t_s = time / landing_duration
+        if t_s >= 1.0:
+            odom.pose.pose.position.z = target_height
+            odom.twist.twist.linear.z = 0.0
+        elif t_s < 0.0:
+            odom.pose.pose.position.z = start_height
+            odom.twist.twist.linear.z = 0.0
+        else:
+            smooth = 3 * t_s * t_s - 2 * t_s * t_s * t_s
+            smooth_dot = (6 * t_s - 6 * t_s * t_s) / landing_duration
+            dz = target_height - start_height
+            odom.pose.pose.position.z = start_height + dz * smooth
+            odom.twist.twist.linear.z = dz * smooth_dot
+
+        odom.pose.pose.position.x = x_stay
+        odom.pose.pose.position.y = y_stay
+        odom.twist.twist.linear.x = 0.0
+        odom.twist.twist.linear.y = 0.0
+        return odom
+
+    def publish_landing_trajectory(self):
+        if not self.landing_flag or self.landing_start_time is None:
+            return False
+
+        now = rospy.Time.now().to_sec()
+        t = now - self.landing_start_time
+        self.target_odom = self.set_landing_height(
+            t,
+            self.landing_duration,
+            self.landing_start_x,
+            self.landing_start_y,
+            self.landing_start_z,
+            self.landing_target_height,
+        )
+        self.target_odom.header.stamp = rospy.Time.now()
+        self.target_pose_and_velocity_pub.publish(self.target_odom)
+
+        pose = self._self_pose()
+        vel = self._self_velocity()
+        laser_height = self._get_self_laser_height(warn=False)
+        if laser_height is None:
+            laser_height = self._latest_self_laser_height()
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] landing uses latest laser height because fresh laser is unavailable: %s",
+                self.uav_id,
+                str(laser_height),
+            )
+        if laser_height is None:
+            laser_height = self.landing_start_z
+
+        self.state_odom.pose.pose.position.x = pose.pose.position.x
+        self.state_odom.pose.pose.position.y = pose.pose.position.y
+        self.state_odom.pose.pose.position.z = laser_height
+        self.state_odom.twist.twist.linear.x = vel.twist.linear.x
+        self.state_odom.twist.twist.linear.y = vel.twist.linear.y
+        self.state_odom.twist.twist.linear.z = vel.twist.linear.z
+        self.pose_and_velocity_pub.publish(self.state_odom)
+        return True
+
     def start(self):
         if self.is_master:
             rospy.wait_for_message(self._master_topic('/mavros/local_position/pose'), PoseStamped)
@@ -604,6 +791,10 @@ class Trajectory():
 
                 self.refresh_reference_on_arm()
                 self.update_relative_heights() #ekf相对高
+
+                if self.publish_landing_trajectory():
+                    self.rate.sleep()
+                    continue
 
                 if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD":
                     t = rospy.Time.now().to_sec() - self.takeoff_start_time
@@ -674,6 +865,10 @@ class Trajectory():
                 self.Follow_yaw = self.Lead_yaw
                 self.target_yaw_pub.publish(self.Follow_yaw)
 
+                if self.publish_landing_trajectory():
+                    self.rate.sleep()
+                    continue
+
                 if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD":
                     t = rospy.Time.now().to_sec() - self.takeoff_start_time
                     self.maybe_reset_takeoff_references(t)
@@ -738,5 +933,3 @@ if __name__ == '__main__':
         traj.start()
     except rospy.ROSInterruptException:
         pass
-
-

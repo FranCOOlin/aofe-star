@@ -11,6 +11,11 @@
     <arg name="demo_mode" default="false"/>
     <arg name="master_auto_start" default="true"/>
     <arg name="max_send_count" default="10"/>
+    <arg name="use_offboard_landing" default="true"/>
+    <arg name="landing_target_height" default="-0.5"/>
+    <arg name="landing_descent_speed" default="0.35"/>
+    <arg name="landing_min_duration" default="5.0"/>
+    <arg name="landing_max_duration" default="30.0"/>
     <arg name="offboard_permission_source" default="manual_control"/>
     <arg name="master_offboard_arm_request_delay" default="0.0"/>
     <arg name="uav1_offboard_arm_request_delay" default="0.4"/>
@@ -67,6 +72,11 @@
         <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
         <arg name="demo_mode" value="$(arg demo_mode)"/>
         <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="use_offboard_landing" value="$(arg use_offboard_landing)"/>
+        <arg name="landing_target_height" value="$(arg landing_target_height)"/>
+        <arg name="landing_descent_speed" value="$(arg landing_descent_speed)"/>
+        <arg name="landing_min_duration" value="$(arg landing_min_duration)"/>
+        <arg name="landing_max_duration" value="$(arg landing_max_duration)"/>
         <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
         <arg name="offboard_arm_request_delay" value="$(arg master_offboard_arm_request_delay)"/>
         <arg name="offboard_switch_channel" value="$(arg offboard_switch_channel)"/>
@@ -108,6 +118,11 @@
         <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
         <arg name="demo_mode" value="$(arg demo_mode)"/>
         <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="use_offboard_landing" value="$(arg use_offboard_landing)"/>
+        <arg name="landing_target_height" value="$(arg landing_target_height)"/>
+        <arg name="landing_descent_speed" value="$(arg landing_descent_speed)"/>
+        <arg name="landing_min_duration" value="$(arg landing_min_duration)"/>
+        <arg name="landing_max_duration" value="$(arg landing_max_duration)"/>
         <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
         <arg name="offboard_arm_request_delay" value="$(arg uav1_offboard_arm_request_delay)"/>
         <arg name="offboard_switch_channel" value="$(arg offboard_switch_channel)"/>
@@ -149,6 +164,11 @@
         <arg name="control_rate_hz" value="$(arg control_rate_hz)"/>
         <arg name="demo_mode" value="$(arg demo_mode)"/>
         <arg name="max_send_count" value="$(arg max_send_count)"/>
+        <arg name="use_offboard_landing" value="$(arg use_offboard_landing)"/>
+        <arg name="landing_target_height" value="$(arg landing_target_height)"/>
+        <arg name="landing_descent_speed" value="$(arg landing_descent_speed)"/>
+        <arg name="landing_min_duration" value="$(arg landing_min_duration)"/>
+        <arg name="landing_max_duration" value="$(arg landing_max_duration)"/>
         <arg name="offboard_permission_source" value="$(arg offboard_permission_source)"/>
         <arg name="offboard_arm_request_delay" value="$(arg uav2_offboard_arm_request_delay)"/>
         <arg name="offboard_switch_channel" value="$(arg offboard_switch_channel)"/>

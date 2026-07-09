@@ -427,14 +427,28 @@
       <child>gps0::link</child>
       <parent>base_link</parent>
     </joint>
+    <!--
+      Downward rangefinder.
+      Keep PX4's nested model://lidar so the MAVLink interface sees the
+      standard Gazebo lidar topic. Use a zero-limit revolute joint instead of
+      a fixed joint so Gazebo does not fold the joint away before the MAVLink
+      plugin scans joints.
+    -->
     <include>
       <uri>model://lidar</uri>
-      <pose>0 0 -0.05 0 0 0</pose>
+      <pose>0.35 0 0.25 0 0 0</pose>
       <name>lidar</name>
     </include>
-    <joint name='lidar_joint' type='fixed'>
-      <child>lidar::link</child>
+    <joint name='lidar_joint' type='revolute'>
       <parent>base_link</parent>
+      <child>lidar::link</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <upper>0</upper>
+          <lower>0</lower>
+        </limit>
+      </axis>
     </joint>
     <plugin name='groundtruth_plugin' filename='libgazebo_groundtruth_plugin.so'>
       <robotNamespace/>

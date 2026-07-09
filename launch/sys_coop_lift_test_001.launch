@@ -66,6 +66,15 @@
     <!-- 降落超时 / demo 模式下落地判据时间，单位 s -->
     <arg name="land_timeout" default="30.0"/>
 
+    <!-- true: 通过 transfer_to_landing 触发 offboard 下降轨迹；false: 切 PX4 AUTO.LAND -->
+    <arg name="use_offboard_landing" default="true"/>
+
+    <!-- Offboard 降落轨迹参数：目标高度使用激光测距语义，单位 m -->
+    <arg name="landing_target_height" default="-0.5"/>
+    <arg name="landing_descent_speed" default="0.35"/>
+    <arg name="landing_min_duration" default="5.0"/>
+    <arg name="landing_max_duration" default="30.0"/>
+
     <!-- ===================================================== -->
     <!-- OFFBOARD / ARM / 人工控制参数                          -->
     <!-- ===================================================== -->
@@ -344,6 +353,9 @@
 
         <!-- 降落超时 / demo 模式下的落地判据时间 -->
         <param name="land_timeout" value="$(arg land_timeout)"/>
+        <param name="use_offboard_landing" value="$(arg use_offboard_landing)"/>
+        <param name="transfer_to_landing_service" value="/$(arg self_id)/transfer_to_landing"/>
+        <param name="transfer_to_landing_service_timeout" value="1.0"/>
 
         <!-- ================================================= -->
         <!-- task_fsm_node 与 sync_gate_node 的本机通信 service  -->
@@ -413,6 +425,7 @@
         <param name="enable_master_pilot_hold_mode" value="true"/>
         <param name="emergency_hold_px4_mode" value="AUTO.LOITER"/>
         <param name="enable_emergency_hold_mode" value="true"/>
+        <!-- use_offboard_landing=false 时使用 PX4 AUTO.LAND。 -->
         <param name="land_px4_mode" value="AUTO.LAND"/>
         <param name="enable_px4_land_mode" value="true"/>
         <param name="return_px4_modes" value="$(arg return_px4_modes)"/>
@@ -545,6 +558,11 @@
         <param name="role" value="$(arg role)"/>
         <param name="takeoff_param_topic" value="/$(arg self_id)/takeoff/param"/>
         <param name="trajectory_reset_service" value="/$(arg self_id)/trajectory/reset"/>
+        <param name="transfer_to_landing_service" value="/$(arg self_id)/transfer_to_landing"/>
+        <param name="landing_target_height" value="$(arg landing_target_height)"/>
+        <param name="landing_descent_speed" value="$(arg landing_descent_speed)"/>
+        <param name="landing_min_duration" value="$(arg landing_min_duration)"/>
+        <param name="landing_max_duration" value="$(arg landing_max_duration)"/>
     </node>
 
     <node if="$(arg launch_controller)"

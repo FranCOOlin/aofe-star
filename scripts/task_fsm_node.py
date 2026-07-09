@@ -48,6 +48,8 @@ task_fsm_node.py
 
 import json
 import math
+import queue
+import threading
 from typing import Any, Dict, Optional, Callable
 
 import rospy
@@ -84,6 +86,15 @@ def safe_json_loads(text: str) -> Optional[dict]:
         return json.loads(text)
     except Exception:
         return None
+
+
+def get_bool_param(name: str, default: bool) -> bool:
+    value = rospy.get_param(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ["1", "true", "yes", "on"]
 
 
 class TaskFSMNode:
@@ -298,6 +309,14 @@ class TaskFSMNode:
         )
 
         self.land_timeout = float(rospy.get_param("~land_timeout", 30.0))
+        self.use_offboard_landing = get_bool_param("~use_offboard_landing", True)
+        self.transfer_to_landing_service = rospy.get_param(
+            "~transfer_to_landing_service",
+            f"/{self.self_id}/transfer_to_landing",
+        )
+        self.transfer_to_landing_service_timeout = float(
+            rospy.get_param("~transfer_to_landing_service_timeout", 1.0)
+        )
 
         # demo 模式：
         # 如果没有接真实高度、落地检测，可以先用时间自动通过部分判断。
@@ -650,6 +669,10 @@ class TaskFSMNode:
         self.arming_srv = rospy.ServiceProxy(
             self.arming_service,
             CommandBool,
+        )
+        self.transfer_to_landing_srv = rospy.ServiceProxy(
+            self.transfer_to_landing_service,
+            JsonPayload,
         )
 
         # ========================================================
@@ -1405,7 +1428,11 @@ class TaskFSMNode:
             self._master_request_sync_if_needed(
                 action="land",
                 payload={
-                    "mode": "PX4_LAND_OR_CONTROLLER_LAND",
+                    "mode": (
+                        "TRAJECTORY_LANDING"
+                        if self.use_offboard_landing
+                        else "PX4_LAND"
+                    ),
                     "requested_by": "operator",
                 },
             )
@@ -1745,6 +1772,9 @@ class TaskFSMNode:
         if not self.enable_offboard_manager:
             return False
 
+        if self._offboard_landing_active():
+            return True
+
         if self.task_state in [
             self.TASK_TAKEOFF_RUNNING,
             self.TASK_WAIT_ENTER_FOLLOW_CMD,
@@ -1792,6 +1822,9 @@ class TaskFSMNode:
         if not self.auto_arm:
             return False
 
+        if self._offboard_landing_active():
+            return True
+
         if self.task_state in [
             self.TASK_TAKEOFF_RUNNING,
             self.TASK_WAIT_ENTER_FOLLOW_CMD,
@@ -1817,8 +1850,15 @@ class TaskFSMNode:
     def _is_return_px4_mode(self) -> bool:
         return self._normalize_px4_mode(self.mavros_mode) in self.return_px4_modes
 
+    def _offboard_landing_active(self) -> bool:
+        return self.task_state == self.TASK_LAND_RUNNING and self.use_offboard_landing
+
     def _should_skip_offboard_pos_requests(self) -> bool:
-        return self.task_state == self.TASK_LAND_RUNNING or self._is_return_px4_mode()
+        px4_land_running = (
+            self.task_state == self.TASK_LAND_RUNNING
+            and not self.use_offboard_landing
+        )
+        return px4_land_running or self._is_return_px4_mode()
 
     def _manage_offboard_and_arm_low_rate(self):
         """
@@ -1891,16 +1931,25 @@ class TaskFSMNode:
             )
             return
 
-        # 关键保护：开关许可不满足时，程序绝不请求 OFFBOARD / ARM。
+        # 关键保护：普通任务中开关许可不满足时，程序绝不请求 OFFBOARD / ARM。
+        # offboard 降落一旦同步开始，需要保持 OFFBOARD 才能继续跟踪下降轨迹。
         if not self.rc_offboard_permission:
-            rospy.logwarn_throttle(
-                2.0,
-                "[%s TaskFSM] state=%s needs OFFBOARD/ARM, but switch source=%s does not permit program control",
-                self.self_id,
-                self.task_state,
-                self.offboard_permission_source,
-            )
-            return
+            if self._offboard_landing_active():
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s TaskFSM] offboard landing active; keep requesting OFFBOARD even though switch source=%s does not permit program control",
+                    self.self_id,
+                    self.offboard_permission_source,
+                )
+            else:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s TaskFSM] state=%s needs OFFBOARD/ARM, but switch source=%s does not permit program control",
+                    self.self_id,
+                    self.task_state,
+                    self.offboard_permission_source,
+                )
+                return
 
         # 先请求 OFFBOARD
         if need_offboard and self.auto_offboard:
@@ -1986,6 +2035,14 @@ class TaskFSMNode:
         """
         请求 PX4 切回 POSCTL。
         """
+        if self._offboard_landing_active():
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TaskFSM] offboard landing active; skip POSCTL request and keep OFFBOARD",
+                self.self_id,
+            )
+            return
+
         if self._should_skip_offboard_pos_requests():
             rospy.logwarn_throttle(
                 2.0,
@@ -2174,6 +2231,100 @@ class TaskFSMNode:
                 self.land_px4_mode,
                 str(e),
             )
+
+    def _request_transfer_to_landing(self):
+        if not self.transfer_to_landing_service:
+            return
+
+        try:
+            rospy.wait_for_service(
+                self.transfer_to_landing_service,
+                timeout=self.transfer_to_landing_service_timeout,
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logerr(
+                "[%s TaskFSM] transfer_to_landing service unavailable service=%s sync_id=%s error=%s",
+                self.self_id,
+                self.transfer_to_landing_service,
+                self.current_sync_id,
+                exc,
+            )
+            return
+
+        request_data = {
+            "src": self.self_id,
+            "stamp": now_sec(),
+            "action": "land",
+            "mode": "TRAJECTORY_LANDING",
+            "sync_id": self.current_sync_id,
+            "t0": self.current_t0,
+            "payload": self.current_payload,
+        }
+        request_payload = json.dumps(
+            request_data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        result_queue = queue.Queue(maxsize=1)
+
+        def _call_service():
+            try:
+                result_queue.put((True, self.transfer_to_landing_srv(request_payload)))
+            except Exception as exc:
+                result_queue.put((False, exc))
+
+        call_thread = threading.Thread(target=_call_service)
+        call_thread.daemon = True
+        call_thread.start()
+
+        try:
+            ok, result = result_queue.get(
+                timeout=self.transfer_to_landing_service_timeout,
+            )
+        except queue.Empty:
+            rospy.logerr(
+                "[%s TaskFSM] transfer_to_landing service no response within %.3fs service=%s sync_id=%s",
+                self.self_id,
+                self.transfer_to_landing_service_timeout,
+                self.transfer_to_landing_service,
+                self.current_sync_id,
+            )
+            return
+
+        if not ok:
+            rospy.logerr(
+                "[%s TaskFSM] transfer_to_landing service call failed service=%s sync_id=%s error=%s",
+                self.self_id,
+                self.transfer_to_landing_service,
+                self.current_sync_id,
+                result,
+            )
+            return
+
+        resp = result
+
+        if bool(getattr(resp, "ok", False)):
+            rospy.loginfo(
+                "[%s TaskFSM] transfer_to_landing service accepted service=%s sync_id=%s t0=%.3f reason=%s payload=%s",
+                self.self_id,
+                self.transfer_to_landing_service,
+                self.current_sync_id,
+                self.current_t0,
+                getattr(resp, "reason", ""),
+                getattr(resp, "payload", ""),
+            )
+            return
+
+        rospy.logerr(
+            "[%s TaskFSM] transfer_to_landing service rejected service=%s sync_id=%s t0=%.3f reason=%s payload=%s",
+            self.self_id,
+            self.transfer_to_landing_service,
+            self.current_sync_id,
+            self.current_t0,
+            getattr(resp, "reason", ""),
+            getattr(resp, "payload", ""),
+        )
 
     def _request_arm(self):
         """
@@ -2459,7 +2610,11 @@ class TaskFSMNode:
             self._master_request_sync_if_needed(
                 action="land",
                 payload={
-                    "mode": "PX4_LAND_OR_CONTROLLER_LAND",
+                    "mode": (
+                        "TRAJECTORY_LANDING"
+                        if self.use_offboard_landing
+                        else "PX4_LAND"
+                    ),
                     "requested_by": "operator_during_hook",
                 },
             )
@@ -2499,9 +2654,11 @@ class TaskFSMNode:
         TASK_LAND_RUNNING：
             同步触发后，所有飞机同时进入 LAND。
 
-        这里请求 PX4 LAND 模式，并用 PX4 landed_state 判断是否落地。
+        offboard 降落由 transfer_to_landing 服务触发；PX4 降落则持续请求 AUTO.LAND。
         """
-        self._ensure_px4_land_mode()
+        if not self.use_offboard_landing:
+            self._ensure_px4_land_mode()
+
         # self.publish_controller_land()
 
         if self.check_landed():
@@ -2930,7 +3087,13 @@ class TaskFSMNode:
         """
         self.land_start_time = now_sec()
 
-        self._ensure_px4_land_mode()
+        if self.use_offboard_landing:
+            self._request_transfer_to_landing()
+            self._set_state(self.TASK_LAND_RUNNING)
+            self._request_offboard_mode()
+            return
+        else:
+            self._ensure_px4_land_mode()
         # self.publish_controller_land()
 
         self._set_state(self.TASK_LAND_RUNNING)
