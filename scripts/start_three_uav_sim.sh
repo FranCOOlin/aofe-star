@@ -17,7 +17,8 @@ AOFESTAR_LAUNCH="${AOFESTAR_LAUNCH:-sys_coop_lift_test_001_three_uav_sim.launch}
 PX4_DIR="${PX4_DIR:-$HOME/PX4-Autopilot}"
 PX4_BUILD_DIR="${PX4_BUILD_DIR:-$PX4_DIR/build/px4_sitl_default}"
 SITL_GAZEBO_CLASSIC_DIR="${SITL_GAZEBO_CLASSIC_DIR:-$PX4_DIR/Tools/simulation/gazebo-classic/sitl_gazebo-classic}"
-PX4_LAUNCH="${PX4_LAUNCH:-multi_uav_mavros_sitl.launch}"
+PX4_LAUNCH_PACKAGE="${PX4_LAUNCH_PACKAGE:-aofe_star}"
+PX4_LAUNCH="${PX4_LAUNCH:-px4_three_uav_high_platform_rangefinder.launch}"
 
 PIDS=()
 
@@ -100,8 +101,8 @@ source_if_exists "/opt/ros/$ROS_DISTRO/setup.bash"
 source_if_exists "$CATKIN_WS/devel/setup.bash"
 setup_px4_gazebo_classic_env
 
-log "starting PX4 SITL: roslaunch px4 $PX4_LAUNCH"
-roslaunch px4 "$PX4_LAUNCH" &
+log "starting PX4 SITL: roslaunch $PX4_LAUNCH_PACKAGE $PX4_LAUNCH"
+roslaunch "$PX4_LAUNCH_PACKAGE" "$PX4_LAUNCH" &
 PIDS+=("$!")
 
 if wait_for_ros_master 45; then

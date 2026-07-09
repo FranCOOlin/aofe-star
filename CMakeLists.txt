@@ -163,6 +163,7 @@ catkin_install_python(PROGRAMS
    scripts/test/minimal_sync_test_node.py
    scripts/test/fsm_auto_test.py
    scripts/test/task_fsm_single_test.py
+   scripts/task_fsm_monitor.py
    scripts/trajectory_nx.py
    scripts/trajectory_reset_service_template.py
    scripts/trajectory_reset_three_uav.py
