@@ -328,7 +328,7 @@ class Control_loop():
         # PID_horizon = PID_Controller(1.4, 0.0, 0.1, 5.0, 10)
         # PID_height = PID_Controller(0.4, 0.01, 0, 1, 10) #不要差分,第三项一定要置为0
         PID_horizon = PID_Controller(1.6, 0.0, 0.2, output_MAX = 6.0, int_i_MAX = 0.8, MAXERR_TOINT = 0.2)
-        PID_height = PID_Controller(0.4, 0.01, 0, output_MAX = 2, int_i_MAX = 0.4, MAXERR_TOINT = 0.5) #不要差分,第三项一定要置为0,测试用限制
+        PID_height = PID_Controller(1, 0.01, 0, output_MAX = 2, int_i_MAX = 0.4, MAXERR_TOINT = 0.5) #不要差分,第三项一定要置为0,测试用限制
         while not rospy.is_shutdown():
             if self.traj_ready and self.state_ready:
                 PID_horizon.calculation(self.traj_xy, self.Follower_xy, True, self.traj_vel_xy, self.Follower_vel_xy)
