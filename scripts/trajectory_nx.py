@@ -5,7 +5,7 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import String, Float32
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import NavSatFix, Range
 from std_srvs.srv import Trigger, TriggerResponse
 from math import *
 import json
@@ -20,9 +20,15 @@ from typing import Optional
 class Trajectory():
     MASTER_UAV_ID = '/uav0'
     DEFAULT_MASTER_HEIGHT_REFERENCE_TOPIC = '/uav0/trajectory/master_height_reference'
+    DEFAULT_LASER_HEIGHT_TOPIC_SUFFIX = '/mavros/distance_sensor/hrlv_ez4_pub'
 
     def _master_topic(self, suffix):
         return self.MASTER_UAV_ID + suffix
+
+    def _normalize_laser_height_topic(self, topic):
+        if topic.endswith(".range"):
+            return topic[:-len(".range")]
+        return topic
 
     def __init__(self):
         rospy.init_node('Trajectory_node',anonymous=True)
@@ -58,6 +64,13 @@ class Trajectory():
         self.initial_pose_z_Leader = 0.0
         self.Leader_relative_z = 0.0
         self.Follower_relative_z = 0.0
+        self.Leader_laser_height = None
+        self.Follower_laser_height = None
+        self.Leader_laser_height_time = 0.0
+        self.Follower_laser_height_time = 0.0
+        self.active_takeoff_t0 = None
+        self.takeoff_horizontal_reference_reset_done = False
+        self.takeoff_z_reference_reset_done = False
         self.Leader_current_mode = ''
         self.self_armed = False
         self.last_self_armed = None
@@ -82,6 +95,26 @@ class Trajectory():
             "~master_height_reference_topic",
             self.DEFAULT_MASTER_HEIGHT_REFERENCE_TOPIC,
         )
+        self.laser_height_topic_suffix = rospy.get_param(
+            "~laser_height_topic_suffix",
+            self.DEFAULT_LASER_HEIGHT_TOPIC_SUFFIX,
+        )
+        self.self_laser_height_topic = self._normalize_laser_height_topic(
+            rospy.get_param(
+                "~self_laser_height_topic",
+                self.uav_id + self.laser_height_topic_suffix,
+            )
+        )
+        self.master_laser_height_topic = self._normalize_laser_height_topic(
+            rospy.get_param(
+                "~master_laser_height_topic",
+                self._master_topic(self.laser_height_topic_suffix),
+            )
+        )
+        self.laser_height_timeout = float(rospy.get_param("~laser_height_timeout", 0.5))
+        self.takeoff_reference_reset_delay = float(
+            rospy.get_param("~takeoff_reference_reset_delay", 1.0)
+        )
 
         self.Leader_pose = PoseStamped()
         self.Follower_pose = PoseStamped()
@@ -100,6 +133,7 @@ class Trajectory():
             rospy.Subscriber(self._master_topic('/mavros/state'), State, self.self_leader_state_callback)
             rospy.Subscriber(self._master_topic("/mavros/local_position/pose"), PoseStamped, self.Leader_pose_and_att_callback)
             rospy.Subscriber(self._master_topic("/mavros/local_position/velocity_local"), TwistStamped, self.Leader_vel_callback)
+            rospy.Subscriber(self.self_laser_height_topic, Range, self.Leader_laser_height_callback)
             self.master_height_reference_pub = rospy.Publisher(
                 self.master_height_reference_topic,
                 Float32,
@@ -115,6 +149,8 @@ class Trajectory():
             rospy.Subscriber(self.uav_id + "/mavros/local_position/velocity_local", TwistStamped, self.Follower_vel_callback)
             rospy.Subscriber(self.uav_id + "/mavros/global_position/global", NavSatFix, self.Follower_global_callback)
             rospy.Subscriber(self._master_topic("/mavros/global_position/global"), NavSatFix, self.Leader_global_callback)
+            rospy.Subscriber(self.master_laser_height_topic, Range, self.Leader_laser_height_callback)
+            rospy.Subscriber(self.self_laser_height_topic, Range, self.Follower_laser_height_callback)
             rospy.Subscriber(
                 self.master_height_reference_topic,
                 Float32,
@@ -167,13 +203,17 @@ class Trajectory():
 
         src = data.get("action", "takeoff")
         stamp = float(data.get("height", 3.0))
-        request_type = data.get("duration", 6.0)
-        payload = data.get("t0", 1777475562.439756)
+        request_type = float(data.get("duration", 6.0))
+        payload = float(data.get("t0", 1777475562.439756))
         self.action = src
         self.target_height = stamp
         self.takeoff_duration = request_type
         self.takeoff_start_time = payload
         if self.action == "takeoff":
+            if self.active_takeoff_t0 is None or abs(payload - self.active_takeoff_t0) > 1e-6:
+                self.active_takeoff_t0 = payload
+                self.takeoff_horizontal_reference_reset_done = False
+                self.takeoff_z_reference_reset_done = False
             self.takeoff_flag = True
 
         rospy.loginfo(
@@ -203,9 +243,36 @@ class Trajectory():
 
     def Leader_vel_callback(self, data):
         self.Leader_vel = data
-    
+
     def Follower_vel_callback(self, data):
         self.Follower_vel = data
+
+    def _range_to_height(self, data, name):
+        height = float(data.range)
+        if not isfinite(height) or height < 0.0:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] ignore invalid %s laser height: %.3f",
+                self.uav_id,
+                name,
+                height,
+            )
+            return None
+        return height
+
+    def Leader_laser_height_callback(self, data):
+        height = self._range_to_height(data, "leader")
+        if height is None:
+            return
+        self.Leader_laser_height = height
+        self.Leader_laser_height_time = rospy.Time.now().to_sec()
+
+    def Follower_laser_height_callback(self, data):
+        height = self._range_to_height(data, "follower")
+        if height is None:
+            return
+        self.Follower_laser_height = height
+        self.Follower_laser_height_time = rospy.Time.now().to_sec()
 
     def Follower_global_callback(self, data):
         self.lat = data.latitude
@@ -230,6 +297,9 @@ class Trajectory():
         #重置
         self.takeoff_flag = False
         self.follow_flag = False
+        self.active_takeoff_t0 = None
+        self.takeoff_horizontal_reference_reset_done = False
+        self.takeoff_z_reference_reset_done = False
         rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, clearing runtime state.", self.uav_id)
         return TriggerResponse(success=True, message="trajectory reset done")
 
@@ -322,6 +392,123 @@ class Trajectory():
             self.initial_Lead_yaw,
         )
 
+    def _is_laser_height_fresh(self, stamp):
+        return stamp > 0.0 and (rospy.Time.now().to_sec() - stamp) <= self.laser_height_timeout
+
+    def _get_leader_laser_height(self, warn=True):
+        if self.Leader_laser_height is not None and self._is_laser_height_fresh(self.Leader_laser_height_time):
+            return self.Leader_laser_height
+
+        if warn:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] waiting fresh leader laser height topic=%s",
+                self.uav_id,
+                self.master_laser_height_topic,
+            )
+        return None
+
+    def _get_follower_laser_height(self, warn=True):
+        if self.Follower_laser_height is not None and self._is_laser_height_fresh(self.Follower_laser_height_time):
+            return self.Follower_laser_height
+
+        if warn:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] waiting fresh follower laser height topic=%s",
+                self.uav_id,
+                self.self_laser_height_topic,
+            )
+        return None
+
+    def update_relative_heights(self):
+        self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
+        if not self.is_master:
+            self.Follower_relative_z = self.Follower_pose.pose.position.z - self.initial_pose_z
+
+    def leader_height_for_takeoff(self):
+        if not self.takeoff_z_reference_reset_done:
+            laser_height = self._get_leader_laser_height()
+            if laser_height is not None:
+                return laser_height
+        return self.Leader_relative_z
+
+    def follower_height_for_takeoff(self):
+        if not self.takeoff_z_reference_reset_done:
+            laser_height = self._get_follower_laser_height()
+            if laser_height is not None:
+                return laser_height
+        return self.Follower_relative_z
+
+    def reset_takeoff_z_reference_from_laser(self, reason):
+        leader_laser_height = self._get_leader_laser_height()
+        if leader_laser_height is None:
+            return False
+
+        follower_laser_height = None
+        if not self.is_master:
+            follower_laser_height = self._get_follower_laser_height()
+            if follower_laser_height is None:
+                return False
+
+        old_leader_z = self.initial_pose_z_Leader
+        leader_ekf_z = self.Leader_pose.pose.position.z
+        self.initial_pose_z_Leader = leader_ekf_z - leader_laser_height
+
+        rospy.logwarn(
+            "[%s TrajectoryNode] %s, reset leader z reference from laser: initial_z %.3f -> %.3f, ekf_z=%.3f, laser_z=%.3f",
+            self.uav_id,
+            reason,
+            old_leader_z,
+            self.initial_pose_z_Leader,
+            leader_ekf_z,
+            leader_laser_height,
+        )
+        if self.is_master:
+            self.publish_master_height_reference(reason)
+        else:
+            old_follower_z = self.initial_pose_z
+            follower_ekf_z = self.Follower_pose.pose.position.z
+            self.initial_pose_z = follower_ekf_z - follower_laser_height
+            rospy.logwarn(
+                "[%s TrajectoryNode] %s, reset follower z reference from laser: initial_z %.3f -> %.3f, ekf_z=%.3f, laser_z=%.3f",
+                self.uav_id,
+                reason,
+                old_follower_z,
+                self.initial_pose_z,
+                follower_ekf_z,
+                follower_laser_height,
+            )
+
+        self.update_relative_heights()
+        return True
+
+    def maybe_reset_takeoff_references(self, t): 
+        if t < self.takeoff_reference_reset_delay:
+            return
+
+        reason = "takeoff +%.1fs" % self.takeoff_reference_reset_delay
+
+        if (
+            not self.is_master
+            and not self.takeoff_horizontal_reference_reset_done
+        ):
+            self.reset_follow_horizontal_reference(reason)
+            self.takeoff_horizontal_reference_reset_done = True
+
+        if self.takeoff_z_reference_reset_done:
+            return
+
+        if self.reset_takeoff_z_reference_from_laser(reason): 
+            self.takeoff_z_reference_reset_done = True
+        else:
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s TrajectoryNode] %s, keep laser height until z reference reset gets fresh laser data.",
+                self.uav_id,
+                reason,
+            )
+
     def refresh_reference_on_arm(self):
         if self.last_self_armed is None:
             self.last_self_armed = self.self_armed
@@ -392,17 +579,19 @@ class Trajectory():
                     rospy.logerr("[%s TrajectoryNode] Leader initial pose set: x=%.2f, y=%.2f, z=%.2f", self.uav_id, self.initial_pose_x_Leader, self.initial_pose_y_Leader, self.initial_pose_z_Leader)
 
                 self.refresh_reference_on_arm()
-                self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
+                self.update_relative_heights() #ekf相对高
 
-                if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD": # 当前若是leader,那也只有offboard有意义
+                if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD":
                     t = rospy.Time.now().to_sec() - self.takeoff_start_time
-                    self.target_odom = self.set_height(t, self.takeoff_duration, self.initial_pose_x_Leader, self.initial_pose_y_Leader, self.target_height, self.Leader_relative_z, self.Leader_relative_z)  # 是Leader时自己减自己相当于不用反馈
+                    self.maybe_reset_takeoff_references(t)
+                    Leader_height = self.leader_height_for_takeoff()
+                    self.target_odom = self.set_height(t, self.takeoff_duration, self.initial_pose_x_Leader, self.initial_pose_y_Leader, self.target_height, Leader_height, Leader_height)
                     self.target_odom.header.stamp = rospy.Time.now()
                     self.target_pose_and_velocity_pub.publish(self.target_odom)
 
                     self.state_odom.pose.pose.position.x = self.Leader_pose.pose.position.x
                     self.state_odom.pose.pose.position.y = self.Leader_pose.pose.position.y
-                    self.state_odom.pose.pose.position.z = self.Leader_relative_z
+                    self.state_odom.pose.pose.position.z = Leader_height 
                     self.state_odom.twist.twist.linear.x = self.Leader_vel.twist.linear.x
                     self.state_odom.twist.twist.linear.y = self.Leader_vel.twist.linear.y
                     self.state_odom.twist.twist.linear.z = self.Leader_vel.twist.linear.z
@@ -454,8 +643,7 @@ class Trajectory():
                     self.takeoff_init_finished = True
                 
                 self.refresh_reference_on_arm()
-                self.Follower_relative_z = self.Follower_pose.pose.position.z - self.initial_pose_z
-                self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
+                self.update_relative_heights()
                 roll, pitch, self.Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
                 self.delta_Lead_yaw = self.Lead_yaw - self.initial_Lead_yaw
                 self.testpub.publish(self.delta_Lead_yaw)
@@ -464,13 +652,16 @@ class Trajectory():
 
                 if self.takeoff_flag and self.Leader_current_mode == "OFFBOARD":
                     t = rospy.Time.now().to_sec() - self.takeoff_start_time
-                    self.target_odom = self.set_height(t, self.takeoff_duration, self.initial_pose_x, self.initial_pose_y, self.target_height, self.Leader_relative_z, self.Follower_relative_z) 
+                    self.maybe_reset_takeoff_references(t)
+                    Leader_height = self.leader_height_for_takeoff()
+                    Follower_height = self.follower_height_for_takeoff()
+                    self.target_odom = self.set_height(t, self.takeoff_duration, self.initial_pose_x, self.initial_pose_y, self.target_height, Leader_height, Follower_height)
                     self.target_odom.header.stamp = rospy.Time.now()
                     self.target_pose_and_velocity_pub.publish(self.target_odom)
 
                     self.state_odom.pose.pose.position.x = self.Follower_pose.pose.position.x
                     self.state_odom.pose.pose.position.y = self.Follower_pose.pose.position.y
-                    self.state_odom.pose.pose.position.z = self.Follower_relative_z
+                    self.state_odom.pose.pose.position.z = Follower_height
                     self.state_odom.twist.twist.linear.x = self.Follower_vel.twist.linear.x
                     self.state_odom.twist.twist.linear.y = self.Follower_vel.twist.linear.y
                     self.state_odom.twist.twist.linear.z = self.Follower_vel.twist.linear.z
