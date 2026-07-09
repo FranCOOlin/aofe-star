@@ -32,8 +32,12 @@ class Trajectory():
         self.takeoff_init_finished = False
         self.follow_flag = False
         self.first_init = True
+        self.post_takeoff_horizontal_reset_done = False
         self.takeoff_start_time = None
         self.action = None
+        self.post_takeoff_horizontal_reset_delay = float(
+            rospy.get_param("~post_takeoff_horizontal_reset_delay", 1.0)
+        )
         self.takeoff_duration = 5.0 # 起飞持续时间
         self.adjust_kp = 0.5 # 反馈参数
         self.target_height = 4.0 # 期望高度
@@ -175,6 +179,7 @@ class Trajectory():
         self.takeoff_start_time = payload
         if self.action == "takeoff":
             self.takeoff_flag = True
+            self.post_takeoff_horizontal_reset_done = False
 
         rospy.loginfo(
             "received request src=%s stamp=%.3f request_type=%s payload=%s",
@@ -230,6 +235,7 @@ class Trajectory():
         #重置
         self.takeoff_flag = False
         self.follow_flag = False
+        self.post_takeoff_horizontal_reset_done = False
         rospy.logerr("[%s TrajectoryNode]Trajectory reset requested, clearing runtime state.", self.uav_id)
         return TriggerResponse(success=True, message="trajectory reset done")
 
@@ -347,6 +353,25 @@ class Trajectory():
             )
 
         self.last_leader_armed = self.leader_armed
+
+    def refresh_post_takeoff_horizontal_reference(self):
+        if self.is_master:
+            return
+        if not self.takeoff_flag or self.post_takeoff_horizontal_reset_done:
+            return
+        if self.takeoff_start_time is None:
+            return
+
+        reset_time = (
+            float(self.takeoff_start_time)
+            + float(self.takeoff_duration)
+            + self.post_takeoff_horizontal_reset_delay
+        )
+        if rospy.Time.now().to_sec() < reset_time:
+            return
+
+        self.reset_follow_horizontal_reference("post takeoff settled")
+        self.post_takeoff_horizontal_reset_done = True
     
     def set_height(self, time, takeoff_duration, x_stay, y_stay, target_height, Leader_height, Follower_height):
         odom = Odometry()
@@ -454,6 +479,7 @@ class Trajectory():
                     self.takeoff_init_finished = True
                 
                 self.refresh_reference_on_arm()
+                self.refresh_post_takeoff_horizontal_reference()
                 self.Follower_relative_z = self.Follower_pose.pose.position.z - self.initial_pose_z
                 self.Leader_relative_z = self.Leader_pose.pose.position.z - self.initial_pose_z_Leader
                 roll, pitch, self.Lead_yaw = self.quaternionToEuler(self.Leader_pose.pose.orientation)
